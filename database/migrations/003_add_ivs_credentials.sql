@@ -1,0 +1,4 @@
+ALTER TABLE events
+  ADD COLUMN IF NOT EXISTS aws_channel_arn VARCHAR(255),
+  ADD COLUMN IF NOT EXISTS stream_ingest_url VARCHAR(512),
+  ADD COLUMN IF NOT EXISTS stream_key_value VARCHAR(255);

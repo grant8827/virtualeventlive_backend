@@ -1,0 +1,2 @@
+ALTER TABLE events ADD COLUMN IF NOT EXISTS ticket_name TEXT NOT NULL DEFAULT 'General Admission';
+ALTER TABLE events ADD COLUMN IF NOT EXISTS max_tickets INT;

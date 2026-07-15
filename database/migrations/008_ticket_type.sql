@@ -1,0 +1,1 @@
+ALTER TABLE events ADD COLUMN IF NOT EXISTS ticket_type TEXT NOT NULL DEFAULT 'Virtual Only';
