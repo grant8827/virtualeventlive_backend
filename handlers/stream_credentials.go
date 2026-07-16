@@ -6,10 +6,13 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"vertualeventlive/backend/services"
 )
 
 type StreamCredentialsHandler struct {
-	DB *pgxpool.Pool
+	DB  *pgxpool.Pool
+	IVS *services.IVSService
 }
 
 func (h *StreamCredentialsHandler) Get(c *fiber.Ctx) error {
@@ -57,4 +60,30 @@ func (h *StreamCredentialsHandler) Get(c *fiber.Ctx) error {
 		"playback_url":     playbackURL,
 		"ivs_ready":        streamIngestURL != nil && streamKeyValue != nil,
 	})
+}
+
+// Status is public — ticket holders poll it from the Watch page to know
+// whether the host is actually broadcasting right now, since a channel being
+// provisioned (aws_channel_arn set at venue-fee time) says nothing about
+// whether anyone is live on it at this exact moment.
+func (h *StreamCredentialsHandler) Status(c *fiber.Ctx) error {
+	eventID := c.Params("id")
+
+	var channelARN *string
+	if err := h.DB.QueryRow(context.Background(),
+		`SELECT aws_channel_arn FROM events WHERE id = $1`, eventID,
+	).Scan(&channelARN); err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "event not found"})
+	}
+
+	if channelARN == nil || *channelARN == "" {
+		return c.JSON(fiber.Map{"live": false})
+	}
+
+	live, err := h.IVS.IsLive(context.Background(), *channelARN)
+	if err != nil {
+		return c.JSON(fiber.Map{"live": false})
+	}
+
+	return c.JSON(fiber.Map{"live": live})
 }

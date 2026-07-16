@@ -56,17 +56,14 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	v1.Delete("/advertisements/:id", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), adH.Delete)
 
 	// Stream credentials — host only, returns IVS ingest URL + stream key
-	credH := &handlers.StreamCredentialsHandler{DB: db}
+	credH := &handlers.StreamCredentialsHandler{DB: db, IVS: ivsSvc}
 	v1.Get("/events/:id/stream-credentials", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), credH.Get)
+	// Public — ticket holders poll this to know if the host is live right now
+	v1.Get("/events/:id/stream-status", credH.Status)
 
 	// Stripe Connect (host onboarding)
 	v1.Post("/connect/onboard", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), stripeH.ConnectOnboard)
 	v1.Get("/connect/status", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), stripeH.ConnectStatus)
-
-	// PayPal / WiPay payout destinations — no OAuth, host just registers where to send payouts
-	payoutH := &handlers.PayoutAccountHandler{DB: db}
-	v1.Get("/payout-accounts", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutH.List)
-	v1.Post("/payout-accounts/:provider", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutH.Upsert)
 
 	// Tickets
 	ticketH := &handlers.TicketHandler{DB: db, Cfg: cfg, Email: emailSvc}

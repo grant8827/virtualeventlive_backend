@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -56,6 +57,25 @@ func (s *IVSService) ProvisionChannel(ctx context.Context, eventTitle string) (*
 		StreamKey:   aws.ToString(out.StreamKey.Value),
 		PlaybackURL: aws.ToString(out.Channel.PlaybackUrl),
 	}, nil
+}
+
+// IsLive reports whether a channel currently has an active broadcast —
+// GetStream returns a ChannelNotBroadcasting error (not a Go error worth
+// surfacing) when the host simply isn't streaming right now.
+func (s *IVSService) IsLive(ctx context.Context, channelARN string) (bool, error) {
+	if !s.Enabled || channelARN == "" {
+		return false, nil
+	}
+
+	_, err := s.client.GetStream(ctx, &ivs.GetStreamInput{ChannelArn: aws.String(channelARN)})
+	if err != nil {
+		var notBroadcasting *types.ChannelNotBroadcasting
+		if errors.As(err, &notBroadcasting) {
+			return false, nil
+		}
+		return false, fmt.Errorf("IVS GetStream: %w", err)
+	}
+	return true, nil
 }
 
 func (s *IVSService) DeleteChannel(ctx context.Context, channelARN string) error {
