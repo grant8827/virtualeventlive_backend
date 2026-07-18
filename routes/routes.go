@@ -61,9 +61,27 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	// Public — ticket holders poll this to know if the host is live right now
 	v1.Get("/events/:id/stream-status", credH.Status)
 
-	// Stripe Connect (host onboarding)
+	// Payouts — host onboarding across Stripe Connect, WiPay, and PayPal
 	v1.Post("/connect/onboard", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), stripeH.ConnectOnboard)
-	v1.Get("/connect/status", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), stripeH.ConnectStatus)
+	payoutH := &handlers.PayoutHandler{
+		DB:  db,
+		Cfg: cfg,
+		WiPay: &services.WiPayService{
+			APIBaseURL:  cfg.WipayAPIBaseURL,
+			APIKey:      cfg.WipayAPIKey,
+			Environment: cfg.WipayEnvironment,
+		},
+		PayPal: &services.PayPalService{
+			ClientID:     cfg.PaypalClientID,
+			ClientSecret: cfg.PaypalClientSecret,
+			Environment:  cfg.PaypalEnvironment,
+		},
+	}
+	v1.Get("/connect/status", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutH.Status)
+	v1.Post("/connect/wipay", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutH.ConnectWiPay)
+	v1.Post("/connect/paypal", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutH.ConnectPayPal)
+	v1.Get("/connect/balance", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutH.Balance)
+	v1.Post("/connect/payout", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutH.Payout)
 
 	// Tickets
 	ticketH := &handlers.TicketHandler{DB: db, Cfg: cfg, Email: emailSvc}

@@ -218,14 +218,18 @@ func (h *TicketHandler) GuestPurchase(c *fiber.Ctx) error {
 	}
 
 	// Stripe checkout
-	var stripeAccountID string
+	var stripeAccountID *string
+	var payoutGateway string
 	err = h.DB.QueryRow(context.Background(),
-		`SELECT ca.stripe_account_id FROM connected_accounts ca
+		`SELECT ca.stripe_account_id, ca.payout_gateway FROM connected_accounts ca
 		 JOIN events e ON e.host_id = ca.user_id
 		 WHERE e.id = $1`,
 		req.EventID,
-	).Scan(&stripeAccountID)
+	).Scan(&stripeAccountID, &payoutGateway)
 	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "host has not connected a payout account"})
+	}
+	if payoutGateway == "stripe" && stripeAccountID == nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "host has not completed Stripe onboarding"})
 	}
 
@@ -247,19 +251,24 @@ func (h *TicketHandler) GuestPurchase(c *fiber.Ctx) error {
 			},
 		},
 		CustomerEmail: stripe.String(req.Email),
-		PaymentIntentData: &stripe.CheckoutSessionPaymentIntentDataParams{
-			ApplicationFeeAmount: stripe.Int64(int64(split.PlatformFee * 100)),
-			TransferData: &stripe.CheckoutSessionPaymentIntentDataTransferDataParams{
-				Destination: stripe.String(stripeAccountID),
-			},
-		},
-		SuccessURL: stripe.String(h.Cfg.FrontendURL + "/ticket-success?email=" + req.Email),
-		CancelURL:  stripe.String(h.Cfg.FrontendURL + "/events/" + req.EventID),
+		SuccessURL:    stripe.String(h.Cfg.FrontendURL + "/ticket-success?email=" + req.Email),
+		CancelURL:     stripe.String(h.Cfg.FrontendURL + "/events/" + req.EventID),
 		Metadata: map[string]string{
 			"type":        "ticket",
 			"event_id":    req.EventID,
 			"guest_email": req.Email,
 		},
+	}
+	// Stripe-connected hosts get paid via a destination charge at checkout time.
+	// WiPay/PayPal hosts are charged into the platform's balance and paid out
+	// separately (see PayoutHandler.Payout), so no transfer here.
+	if payoutGateway == "stripe" {
+		params.PaymentIntentData = &stripe.CheckoutSessionPaymentIntentDataParams{
+			ApplicationFeeAmount: stripe.Int64(int64(split.PlatformFee * 100)),
+			TransferData: &stripe.CheckoutSessionPaymentIntentDataTransferDataParams{
+				Destination: stripe.String(*stripeAccountID),
+			},
+		}
 	}
 
 	s, err := session.New(params)
@@ -294,21 +303,25 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 	var (
 		eventTitle      string
 		ticketPrice     float64
-		stripeAccountID string
+		stripeAccountID *string
+		payoutGateway   string
 		buyerEmail      string
 	)
 	err := h.DB.QueryRow(context.Background(),
-		`SELECT e.title, e.ticket_price, ca.stripe_account_id, u.email
+		`SELECT e.title, e.ticket_price, ca.stripe_account_id, ca.payout_gateway, u.email
 		 FROM events e
 		 JOIN connected_accounts ca ON ca.user_id = e.host_id
 		 JOIN users u ON u.id = $2
 		 WHERE e.id = $1 AND e.is_active = true AND e.venue_paid = true AND e.ends_at > NOW()`,
 		req.EventID, buyerID,
-	).Scan(&eventTitle, &ticketPrice, &stripeAccountID, &buyerEmail)
+	).Scan(&eventTitle, &ticketPrice, &stripeAccountID, &payoutGateway, &buyerEmail)
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-			"error": "event not found, not yet published, or host has not completed Stripe onboarding",
+			"error": "event not found, not yet published, or host has not connected a payout account",
 		})
+	}
+	if payoutGateway == "stripe" && stripeAccountID == nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "host has not completed Stripe onboarding"})
 	}
 
 	split := services.CalculateSplit(ticketPrice)
@@ -329,19 +342,21 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 			},
 		},
 		CustomerEmail: stripe.String(buyerEmail),
-		PaymentIntentData: &stripe.CheckoutSessionPaymentIntentDataParams{
-			ApplicationFeeAmount: stripe.Int64(int64(split.PlatformFee * 100)),
-			TransferData: &stripe.CheckoutSessionPaymentIntentDataTransferDataParams{
-				Destination: stripe.String(stripeAccountID),
-			},
-		},
-		SuccessURL: stripe.String(h.Cfg.FrontendURL + "/ticket-success?email=" + buyerEmail),
-		CancelURL:  stripe.String(h.Cfg.FrontendURL + "/events/" + req.EventID),
+		SuccessURL:    stripe.String(h.Cfg.FrontendURL + "/ticket-success?email=" + buyerEmail),
+		CancelURL:     stripe.String(h.Cfg.FrontendURL + "/events/" + req.EventID),
 		Metadata: map[string]string{
 			"type":     "ticket",
 			"event_id": req.EventID,
 			"buyer_id": buyerID,
 		},
+	}
+	if payoutGateway == "stripe" {
+		params.PaymentIntentData = &stripe.CheckoutSessionPaymentIntentDataParams{
+			ApplicationFeeAmount: stripe.Int64(int64(split.PlatformFee * 100)),
+			TransferData: &stripe.CheckoutSessionPaymentIntentDataTransferDataParams{
+				Destination: stripe.String(*stripeAccountID),
+			},
+		}
 	}
 
 	s, err := session.New(params)

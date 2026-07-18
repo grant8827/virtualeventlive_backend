@@ -42,6 +42,11 @@ func (h *StripeHandler) ConnectOnboard(c *fiber.Ctx) error {
 	var stripeAccountID string
 	if existingAccountID != "" {
 		stripeAccountID = existingAccountID
+		// Re-activate Stripe as the payout gateway in case the host had
+		// switched to WiPay/PayPal since first onboarding here.
+		_, _ = h.DB.Exec(context.Background(),
+			`UPDATE connected_accounts SET payout_gateway = 'stripe' WHERE user_id = $1`, hostID,
+		)
 	} else {
 		acc, err := account.New(&stripe.AccountParams{
 			Type: stripe.String(string(stripe.AccountTypeExpress)),
@@ -56,8 +61,9 @@ func (h *StripeHandler) ConnectOnboard(c *fiber.Ctx) error {
 
 		stripeAccountID = acc.ID
 		_, err = h.DB.Exec(context.Background(),
-			`INSERT INTO connected_accounts (user_id, stripe_account_id) VALUES ($1, $2)
-			 ON CONFLICT (stripe_account_id) DO NOTHING`,
+			`INSERT INTO connected_accounts (user_id, stripe_account_id, payout_gateway)
+			 VALUES ($1, $2, 'stripe')
+			 ON CONFLICT (user_id) DO UPDATE SET stripe_account_id = EXCLUDED.stripe_account_id, payout_gateway = 'stripe'`,
 			hostID, stripeAccountID,
 		)
 		if err != nil {
@@ -76,28 +82,6 @@ func (h *StripeHandler) ConnectOnboard(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{"url": link.URL})
-}
-
-func (h *StripeHandler) ConnectStatus(c *fiber.Ctx) error {
-	hostID, ok := c.Locals("user_id").(string)
-	if !ok || hostID == "" {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
-	}
-
-	var stripeAccountID string
-	var payoutEnabled bool
-	err := h.DB.QueryRow(context.Background(),
-		`SELECT stripe_account_id, payout_enabled FROM connected_accounts WHERE user_id = $1`, hostID,
-	).Scan(&stripeAccountID, &payoutEnabled)
-	if err != nil {
-		return c.JSON(fiber.Map{"connected": false, "payout_enabled": false})
-	}
-
-	return c.JSON(fiber.Map{
-		"connected":      true,
-		"stripe_account": stripeAccountID,
-		"payout_enabled": payoutEnabled,
-	})
 }
 
 func (h *StripeHandler) Webhook(c *fiber.Ctx) error {
@@ -237,11 +221,27 @@ func (h *StripeHandler) handleTicketPurchase(sess *stripe.CheckoutSession) error
 		return fmt.Errorf("insert ticket: %w", insertErr)
 	}
 
+	var payoutGateway string
+	_ = h.DB.QueryRow(context.Background(),
+		`SELECT ca.payout_gateway FROM connected_accounts ca
+		 JOIN events e ON e.host_id = ca.user_id WHERE e.id = $1`,
+		eventID,
+	).Scan(&payoutGateway)
+	if payoutGateway == "" {
+		payoutGateway = "stripe"
+	}
+	// Stripe hosts are paid via destination charge at checkout, so their
+	// entries settle immediately. WiPay/PayPal hosts wait for a manual payout.
+	payoutStatus := "paid"
+	if payoutGateway != "stripe" {
+		payoutStatus = "pending"
+	}
+
 	split := services.CalculateSplit(ticketPrice)
 	if _, err := h.DB.Exec(context.Background(),
-		`INSERT INTO ledger_entries (ticket_id, event_id, gross_amount, stripe_fee, platform_fee, host_payout)
-		 VALUES ($1,$2,$3,$4,$5,$6)`,
-		ticketID, eventID, split.GrossAmount, split.StripeFee, split.PlatformFee, split.HostPayout,
+		`INSERT INTO ledger_entries (ticket_id, event_id, gross_amount, stripe_fee, platform_fee, host_payout, payout_gateway, payout_status)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+		ticketID, eventID, split.GrossAmount, split.StripeFee, split.PlatformFee, split.HostPayout, payoutGateway, payoutStatus,
 	); err != nil {
 		return fmt.Errorf("insert ledger: %w", err)
 	}

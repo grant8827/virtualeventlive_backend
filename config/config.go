@@ -19,6 +19,18 @@ type Config struct {
 	AWSAccessKeyID      string
 	AWSSecretAccessKey  string
 	AWSRegion           string
+
+	// WiPay — Caribbean payout rail. Host payouts are sent to WipayAccountNumber
+	// via WipayAPIBaseURL once WiPay confirms their disbursement endpoint contract;
+	// unset until then, so payouts stay queued as "pending" rather than firing blind.
+	WipayAPIBaseURL  string
+	WipayAPIKey      string
+	WipayEnvironment string
+
+	// PayPal — Payouts API (https://developer.paypal.com/docs/payouts/).
+	PaypalClientID     string
+	PaypalClientSecret string
+	PaypalEnvironment  string
 }
 
 func Load() *Config {
@@ -36,6 +48,14 @@ func Load() *Config {
 		AWSAccessKeyID:      getEnv("AWS_ACCESS_KEY_ID", ""),
 		AWSSecretAccessKey:  getEnv("AWS_SECRET_ACCESS_KEY", ""),
 		AWSRegion:           getEnv("AWS_REGION", "us-east-1"),
+
+		WipayAPIBaseURL:  getEnv("WIPAY_API_BASE_URL", ""),
+		WipayAPIKey:      getEnv("WIPAY_API_KEY", ""),
+		WipayEnvironment: getEnv("WIPAY_ENVIRONMENT", "sandbox"),
+
+		PaypalClientID:     getEnv("PAYPAL_CLIENT_ID", ""),
+		PaypalClientSecret: getEnv("PAYPAL_CLIENT_SECRET", ""),
+		PaypalEnvironment:  getEnv("PAYPAL_ENVIRONMENT", "sandbox"),
 	}
 }
 
