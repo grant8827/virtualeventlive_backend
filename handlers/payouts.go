@@ -106,6 +106,7 @@ func (h *PayoutHandler) ConnectWiPay(c *fiber.Ctx) error {
 	); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save WiPay account"})
 	}
+	auditPayoutEvent(h.DB, c, hostID, "wipay_account_connected")
 
 	return c.JSON(fiber.Map{"connected": true, "active_gateway": "wipay"})
 }
@@ -136,6 +137,7 @@ func (h *PayoutHandler) ConnectPayPal(c *fiber.Ctx) error {
 	); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save PayPal account"})
 	}
+	auditPayoutEvent(h.DB, c, hostID, "paypal_account_connected")
 
 	return c.JSON(fiber.Map{"connected": true, "active_gateway": "paypal"})
 }
@@ -235,6 +237,7 @@ func (h *PayoutHandler) Payout(c *fiber.Ctx) error {
 	); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "payout sent but failed to update ledger — contact support"})
 	}
+	auditPayoutEvent(h.DB, c, hostID, "payout_sent_"+gateway)
 
 	return c.JSON(fiber.Map{"paid": true, "amount": pending, "gateway": gateway, "reference": transactionRef})
 }

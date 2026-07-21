@@ -62,7 +62,12 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	v1.Get("/events/:id/stream-status", credH.Status)
 
 	// Payouts — host onboarding across Stripe Connect, WiPay, and PayPal
-	v1.Post("/connect/onboard", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), stripeH.ConnectOnboard)
+	payoutAuth := middleware.RequirePayoutUnlock(cfg.JWTSecret)
+	payoutSecurityH := &handlers.PayoutSecurityHandler{DB: db, Cfg: cfg}
+	v1.Get("/connect/security/status", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutSecurityH.Status)
+	v1.Post("/connect/security/passcode", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutSecurityH.Create)
+	v1.Post("/connect/security/unlock", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutSecurityH.Unlock)
+	v1.Post("/connect/onboard", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutAuth, stripeH.ConnectOnboard)
 	payoutH := &handlers.PayoutHandler{
 		DB:  db,
 		Cfg: cfg,
@@ -77,11 +82,11 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 			Environment:  cfg.PaypalEnvironment,
 		},
 	}
-	v1.Get("/connect/status", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutH.Status)
-	v1.Post("/connect/wipay", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutH.ConnectWiPay)
-	v1.Post("/connect/paypal", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutH.ConnectPayPal)
-	v1.Get("/connect/balance", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutH.Balance)
-	v1.Post("/connect/payout", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutH.Payout)
+	v1.Get("/connect/status", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutAuth, payoutH.Status)
+	v1.Post("/connect/wipay", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutAuth, payoutH.ConnectWiPay)
+	v1.Post("/connect/paypal", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutAuth, payoutH.ConnectPayPal)
+	v1.Get("/connect/balance", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutAuth, payoutH.Balance)
+	v1.Post("/connect/payout", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutAuth, payoutH.Payout)
 
 	// Tickets
 	ticketH := &handlers.TicketHandler{DB: db, Cfg: cfg, Email: emailSvc}

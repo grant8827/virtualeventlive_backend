@@ -81,6 +81,7 @@ func (h *StripeHandler) ConnectOnboard(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to create onboarding link"})
 	}
 
+	auditPayoutEvent(h.DB, c, hostID, "stripe_onboarding_started")
 	return c.JSON(fiber.Map{"url": link.URL})
 }
 
