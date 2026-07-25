@@ -10,8 +10,9 @@ import (
 )
 
 type HealthHandler struct {
-	DB  *pgxpool.Pool
-	RDB *redis.Client
+	DB         *pgxpool.Pool
+	RDB        *redis.Client
+	IVSEnabled bool
 }
 
 func (h *HealthHandler) Check(c *fiber.Ctx) error {
@@ -34,9 +35,10 @@ func (h *HealthHandler) Check(c *fiber.Ctx) error {
 	}
 
 	return c.Status(httpStatus).JSON(fiber.Map{
-		"status":    "vertualeventlive api",
-		"postgres":  dbStatus,
-		"redis":     redisStatus,
-		"timestamp": time.Now().UTC(),
+		"status":      "vertualeventlive api",
+		"postgres":    dbStatus,
+		"redis":       redisStatus,
+		"ivs_enabled": h.IVSEnabled,
+		"timestamp":   time.Now().UTC(),
 	})
 }

@@ -21,7 +21,7 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	ivsSvc := services.NewIVSService(cfg.AWSAccessKeyID, cfg.AWSSecretAccessKey, cfg.AWSRegion)
 
 	// Health check
-	health := &handlers.HealthHandler{DB: db, RDB: rdb}
+	health := &handlers.HealthHandler{DB: db, RDB: rdb, IVSEnabled: ivsSvc.Enabled}
 	app.Get("/health", health.Check)
 
 	// Stripe webhook — before body parser; needs raw body intact
