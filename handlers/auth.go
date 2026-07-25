@@ -19,9 +19,17 @@ type AuthHandler struct {
 }
 
 type registerRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
-	Role     string `json:"role"` // "buyer" | "host"
+	Email            string `json:"email"`
+	Password         string `json:"password"`
+	FullName         string `json:"full_name"`
+	Phone            string `json:"phone"`
+	AddressLine1     string `json:"address_line1"`
+	AddressLine2     string `json:"address_line2"`
+	City             string `json:"city"`
+	State            string `json:"state"`
+	PostalCode       string `json:"postal_code"`
+	Country          string `json:"country"`
+	OrganizationName string `json:"organization_name"`
 }
 
 type loginRequest struct {
@@ -37,8 +45,9 @@ func (h *AuthHandler) Register(c *fiber.Ctx) error {
 	if req.Email == "" || req.Password == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "email and password are required"})
 	}
-	if req.Role != "buyer" && req.Role != "host" {
-		req.Role = "buyer"
+	if req.FullName == "" || req.Phone == "" || req.AddressLine1 == "" || req.City == "" ||
+		req.State == "" || req.PostalCode == "" || req.Country == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "full name, phone, and address are required"})
 	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
@@ -48,8 +57,13 @@ func (h *AuthHandler) Register(c *fiber.Ctx) error {
 
 	var userID string
 	err = h.DB.QueryRow(context.Background(),
-		`INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id`,
-		req.Email, string(hash), req.Role,
+		`INSERT INTO users (
+			email, password_hash, role, full_name, phone,
+			address_line1, address_line2, city, state, postal_code, country, organization_name
+		) VALUES ($1, $2, 'host', $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		RETURNING id`,
+		req.Email, string(hash), req.FullName, req.Phone,
+		req.AddressLine1, req.AddressLine2, req.City, req.State, req.PostalCode, req.Country, req.OrganizationName,
 	).Scan(&userID)
 	if err != nil {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "email already in use"})
@@ -58,7 +72,7 @@ func (h *AuthHandler) Register(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"id":    userID,
 		"email": req.Email,
-		"role":  req.Role,
+		"role":  "host",
 	})
 }
 
