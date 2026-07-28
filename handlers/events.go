@@ -287,7 +287,7 @@ func (h *EventHandler) ListByHost(c *fiber.Ctx) error {
 func (h *EventHandler) ListPublic(c *fiber.Ctx) error {
 	rows, err := h.DB.Query(context.Background(),
 		`SELECT id, title, event_type, start_time, ends_at,
-		        ticket_price, ticket_type, card_bg_from, card_bg_to
+		        ticket_price, ticket_type, card_bg_from, card_bg_to, card_bg_image
 		 FROM events
 		 WHERE venue_paid = true AND ends_at > NOW()
 		 ORDER BY start_time ASC
@@ -308,6 +308,7 @@ func (h *EventHandler) ListPublic(c *fiber.Ctx) error {
 		TicketType  string     `json:"ticket_type"`
 		CardBgFrom  string     `json:"card_bg_from"`
 		CardBgTo    string     `json:"card_bg_to"`
+		CardBgImage *string    `json:"card_bg_image"`
 	}
 
 	events := []publicEvent{}
@@ -315,7 +316,7 @@ func (h *EventHandler) ListPublic(c *fiber.Ctx) error {
 		var e publicEvent
 		if err := rows.Scan(
 			&e.ID, &e.Title, &e.EventType, &e.StartsAt, &e.EndsAt,
-			&e.TicketPrice, &e.TicketType, &e.CardBgFrom, &e.CardBgTo,
+			&e.TicketPrice, &e.TicketType, &e.CardBgFrom, &e.CardBgTo, &e.CardBgImage,
 		); err != nil {
 			continue
 		}

@@ -74,7 +74,7 @@ func (h *TicketHandler) Lookup(c *fiber.Ctx) error {
 
 	rows, err := h.DB.Query(context.Background(),
 		`SELECT t.id, t.access_token, t.purchased_at,
-		        e.id AS event_id, e.title, e.start_time, e.is_active, e.ends_at
+		        e.id AS event_id, e.title, e.start_time, e.is_active, e.ends_at, e.card_bg_image
 		 FROM tickets t
 		 JOIN events e ON e.id = t.event_id
 		 LEFT JOIN users u ON u.id = t.buyer_id
@@ -96,6 +96,7 @@ func (h *TicketHandler) Lookup(c *fiber.Ctx) error {
 		EventStartsAt time.Time `json:"event_starts_at"`
 		EventIsActive bool      `json:"event_is_active"`
 		EventExpired  bool      `json:"event_expired"`
+		CardBgImage   *string   `json:"card_bg_image"`
 	}
 
 	tickets := []ticketRow{}
@@ -103,7 +104,7 @@ func (h *TicketHandler) Lookup(c *fiber.Ctx) error {
 		var t ticketRow
 		var endsAt time.Time
 		if err := rows.Scan(&t.ID, &t.AccessToken, &t.PurchasedAt,
-			&t.EventID, &t.EventTitle, &t.EventStartsAt, &t.EventIsActive, &endsAt); err != nil {
+			&t.EventID, &t.EventTitle, &t.EventStartsAt, &t.EventIsActive, &endsAt, &t.CardBgImage); err != nil {
 			continue
 		}
 		t.EventExpired = time.Now().After(endsAt)
