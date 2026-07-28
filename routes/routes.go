@@ -58,6 +58,7 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	// Stream credentials — host only, returns IVS ingest URL + stream key
 	credH := &handlers.StreamCredentialsHandler{DB: db, IVS: ivsSvc}
 	v1.Get("/events/:id/stream-credentials", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), credH.Get)
+	v1.Post("/events/:id/reprovision-stream", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), credH.Reprovision)
 	// Public — ticket holders poll this to know if the host is live right now
 	v1.Get("/events/:id/stream-status", credH.Status)
 
