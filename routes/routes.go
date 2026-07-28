@@ -46,6 +46,7 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	v1.Post("/events/:id/checkout", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.Checkout)
 	v1.Patch("/events/:id/ticket", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.TicketSetup)
 	v1.Post("/events/:id/bypass-activate", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.BypassActivate)
+	v1.Delete("/events/:id", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.Delete)
 
 	// Advertisements
 	adH := &handlers.AdvertisementHandler{DB: db}

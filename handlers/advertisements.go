@@ -106,8 +106,8 @@ func (h *AdvertisementHandler) ListPublic(c *fiber.Ctx) error {
 		`SELECT a.id, a.headline, a.body, a.image_url, a.cta_text,
 		        a.event_id, e.title AS event_title, a.created_at
 		 FROM advertisements a
-		 LEFT JOIN events e ON e.id = a.event_id
-		 WHERE a.is_active = true AND (a.event_id IS NULL OR e.ends_at > NOW())
+		 JOIN events e ON e.id = a.event_id
+		 WHERE a.is_active = true AND e.start_time > NOW()
 		 ORDER BY a.created_at DESC
 		 LIMIT 20`,
 	)
@@ -117,14 +117,14 @@ func (h *AdvertisementHandler) ListPublic(c *fiber.Ctx) error {
 	defer rows.Close()
 
 	type adRow struct {
-		ID         string     `json:"id"`
-		Headline   string     `json:"headline"`
-		Body       string     `json:"body"`
-		ImageURL   string     `json:"image_url"`
-		CTAText    string     `json:"cta_text"`
-		EventID    *string    `json:"event_id"`
-		EventTitle *string    `json:"event_title"`
-		CreatedAt  time.Time  `json:"created_at"`
+		ID         string    `json:"id"`
+		Headline   string    `json:"headline"`
+		Body       string    `json:"body"`
+		ImageURL   string    `json:"image_url"`
+		CTAText    string    `json:"cta_text"`
+		EventID    *string   `json:"event_id"`
+		EventTitle *string   `json:"event_title"`
+		CreatedAt  time.Time `json:"created_at"`
 	}
 
 	ads := []adRow{}

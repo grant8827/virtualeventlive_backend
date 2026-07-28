@@ -219,6 +219,53 @@ func (h *EventHandler) BypassActivate(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"ok": true})
 }
 
+// Delete removes a host-owned event only while its scheduled start is still
+// in the future. Related tickets and ledger entries cascade from the event;
+// advertisements are removed explicitly instead of being left orphaned.
+func (h *EventHandler) Delete(c *fiber.Ctx) error {
+	hostID, ok := c.Locals("user_id").(string)
+	if !ok || hostID == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+
+	tx, err := h.DB.Begin(context.Background())
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to delete event"})
+	}
+	defer tx.Rollback(context.Background())
+
+	eventID := c.Params("id")
+	if _, err := tx.Exec(context.Background(),
+		`DELETE FROM advertisements
+		 WHERE event_id = $1 AND host_id = $2
+		   AND EXISTS (
+		       SELECT 1 FROM events
+		       WHERE id = $1 AND host_id = $2 AND start_time > NOW()
+		   )`,
+		eventID, hostID,
+	); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to delete event advertisements"})
+	}
+
+	result, err := tx.Exec(context.Background(),
+		`DELETE FROM events
+		 WHERE id = $1 AND host_id = $2 AND start_time > NOW()`,
+		eventID, hostID,
+	)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to delete event"})
+	}
+	if result.RowsAffected() == 0 {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "only upcoming events can be deleted"})
+	}
+
+	if err := tx.Commit(context.Background()); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to delete event"})
+	}
+
+	return c.JSON(fiber.Map{"ok": true})
+}
+
 func (h *EventHandler) ListByHost(c *fiber.Ctx) error {
 	hostID, ok := c.Locals("user_id").(string)
 	if !ok || hostID == "" {
@@ -289,7 +336,7 @@ func (h *EventHandler) ListPublic(c *fiber.Ctx) error {
 		`SELECT id, title, event_type, start_time, ends_at,
 		        ticket_price, ticket_type, card_bg_from, card_bg_to, card_bg_image
 		 FROM events
-		 WHERE venue_paid = true AND ends_at > NOW()
+		 WHERE venue_paid = true AND start_time > NOW()
 		 ORDER BY start_time ASC
 		 LIMIT 50`,
 	)
