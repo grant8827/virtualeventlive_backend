@@ -46,10 +46,11 @@ func (s *IVSService) ProvisionChannel(ctx context.Context, eventTitle string) (*
 		return nil, fmt.Errorf("IVS not configured — set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
 	}
 
+	// LOW latency and STANDARD type are the IVS defaults. Supplying only the
+	// sanitized name avoids account/SDK validation differences for optional
+	// enum fields while retaining the desired channel configuration.
 	out, err := s.client.CreateChannel(ctx, &ivs.CreateChannelInput{
-		Name:        aws.String(ivsChannelName(eventTitle)),
-		LatencyMode: types.ChannelLatencyModeLowLatency,
-		Type:        types.ChannelTypeStandardChannelType,
+		Name: aws.String(ivsChannelName(eventTitle)),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("IVS CreateChannel: %w", err)
