@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -11,11 +13,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ivs/types"
 )
 
+var invalidIVSChannelNameChars = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
+
 type StreamCredentials struct {
-	ChannelARN     string
-	IngestURL      string
-	StreamKey      string
-	PlaybackURL    string
+	ChannelARN  string
+	IngestURL   string
+	StreamKey   string
+	PlaybackURL string
 }
 
 type IVSService struct {
@@ -28,7 +32,7 @@ func NewIVSService(accessKeyID, secretKey, region string) *IVSService {
 		return &IVSService{Enabled: false}
 	}
 	cfg := aws.Config{
-		Region: region,
+		Region:      region,
 		Credentials: credentials.NewStaticCredentialsProvider(accessKeyID, secretKey, ""),
 	}
 	return &IVSService{
@@ -43,7 +47,7 @@ func (s *IVSService) ProvisionChannel(ctx context.Context, eventTitle string) (*
 	}
 
 	out, err := s.client.CreateChannel(ctx, &ivs.CreateChannelInput{
-		Name:        aws.String(eventTitle),
+		Name:        aws.String(ivsChannelName(eventTitle)),
 		LatencyMode: types.ChannelLatencyModeLowLatency,
 		Type:        types.ChannelTypeStandardChannelType,
 	})
@@ -57,6 +61,18 @@ func (s *IVSService) ProvisionChannel(ctx context.Context, eventTitle string) (*
 		StreamKey:   aws.ToString(out.StreamKey.Value),
 		PlaybackURL: aws.ToString(out.Channel.PlaybackUrl),
 	}, nil
+}
+
+func ivsChannelName(eventTitle string) string {
+	name := invalidIVSChannelNameChars.ReplaceAllString(strings.TrimSpace(eventTitle), "-")
+	name = strings.Trim(name, "-_")
+	if name == "" {
+		name = "event"
+	}
+	if len(name) > 128 {
+		name = strings.TrimRight(name[:128], "-_")
+	}
+	return name
 }
 
 // IsLive reports whether a channel currently has an active broadcast —
