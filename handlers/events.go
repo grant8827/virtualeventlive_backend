@@ -219,9 +219,9 @@ func (h *EventHandler) BypassActivate(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"ok": true})
 }
 
-// Delete removes a host-owned event only while its scheduled start is still
-// in the future. Related tickets and ledger entries cascade from the event;
-// advertisements are removed explicitly instead of being left orphaned.
+// Delete permanently removes a host-owned event. Related tickets and ledger
+// entries cascade from the event; advertisements are removed explicitly
+// instead of being left orphaned.
 func (h *EventHandler) Delete(c *fiber.Ctx) error {
 	hostID, ok := c.Locals("user_id").(string)
 	if !ok || hostID == "" {
@@ -240,7 +240,7 @@ func (h *EventHandler) Delete(c *fiber.Ctx) error {
 		 WHERE event_id = $1 AND host_id = $2
 		   AND EXISTS (
 		       SELECT 1 FROM events
-		       WHERE id = $1 AND host_id = $2 AND start_time > NOW()
+		       WHERE id = $1 AND host_id = $2
 		   )`,
 		eventID, hostID,
 	); err != nil {
@@ -249,14 +249,14 @@ func (h *EventHandler) Delete(c *fiber.Ctx) error {
 
 	result, err := tx.Exec(context.Background(),
 		`DELETE FROM events
-		 WHERE id = $1 AND host_id = $2 AND start_time > NOW()`,
+		 WHERE id = $1 AND host_id = $2`,
 		eventID, hostID,
 	)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to delete event"})
 	}
 	if result.RowsAffected() == 0 {
-		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "only upcoming events can be deleted"})
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "event not found"})
 	}
 
 	if err := tx.Commit(context.Background()); err != nil {
