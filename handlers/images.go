@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -116,21 +117,12 @@ func (h *ImageHandler) Get(c *fiber.Ctx) error {
 		return c.SendStatus(fiber.StatusNotFound)
 	}
 
-	out, err := h.Storage.Get(context.Background(), eventImageKey(eventID, kind))
+	url, err := h.Storage.PresignGet(context.Background(), eventImageKey(eventID, kind), 15*time.Minute)
 	if err != nil {
 		return c.SendStatus(fiber.StatusNotFound)
 	}
-	defer out.Body.Close()
-
-	data, err := io.ReadAll(io.LimitReader(out.Body, maxImageBytes+1))
-	if err != nil || len(data) == 0 || len(data) > maxImageBytes {
-		return c.SendStatus(fiber.StatusBadGateway)
-	}
-	if out.ContentType != nil {
-		c.Set(fiber.HeaderContentType, *out.ContentType)
-	}
-	c.Set(fiber.HeaderCacheControl, "public, max-age=3600")
-	return c.Send(data)
+	c.Set(fiber.HeaderCacheControl, "private, max-age=300")
+	return c.Redirect(url, fiber.StatusTemporaryRedirect)
 }
 
 func (h *ImageHandler) Delete(c *fiber.Ctx) error {

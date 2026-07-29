@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -12,6 +13,7 @@ import (
 
 type S3Storage struct {
 	client  *s3.Client
+	presign *s3.PresignClient
 	bucket  string
 	Enabled bool
 }
@@ -25,11 +27,27 @@ func NewS3Storage(accessKeyID, secretKey, region, bucket string) *S3Storage {
 		Region:      region,
 		Credentials: credentials.NewStaticCredentialsProvider(accessKeyID, secretKey, ""),
 	}
+	client := s3.NewFromConfig(cfg)
 	return &S3Storage{
-		client:  s3.NewFromConfig(cfg),
+		client:  client,
+		presign: s3.NewPresignClient(client),
 		bucket:  bucket,
 		Enabled: true,
 	}
+}
+
+func (s *S3Storage) PresignGet(ctx context.Context, key string, lifetime time.Duration) (string, error) {
+	if !s.Enabled {
+		return "", fmt.Errorf("S3 image storage is not configured")
+	}
+	out, err := s.presign.PresignGetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	}, s3.WithPresignExpires(lifetime))
+	if err != nil {
+		return "", fmt.Errorf("S3 PresignGetObject: %w", err)
+	}
+	return out.URL, nil
 }
 
 func (s *S3Storage) Put(ctx context.Context, key, contentType string, body io.Reader, contentLength int64) error {
