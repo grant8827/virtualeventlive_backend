@@ -77,3 +77,14 @@ func (s *S3Storage) Delete(ctx context.Context, key string) error {
 	}
 	return nil
 }
+
+func (s *S3Storage) Check(ctx context.Context) error {
+	if !s.Enabled {
+		return fmt.Errorf("not configured")
+	}
+	_, err := s.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(s.bucket)})
+	if err != nil {
+		return fmt.Errorf("S3 HeadBucket: %w", err)
+	}
+	return nil
+}

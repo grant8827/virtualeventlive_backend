@@ -40,6 +40,7 @@ func main() {
 		AppName:      "VirtualEventLive API v1",
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
+		BodyLimit:    9 << 20,
 	})
 
 	app.Use(recover.New())

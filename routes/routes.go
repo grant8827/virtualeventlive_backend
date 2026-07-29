@@ -27,7 +27,7 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	)
 
 	// Health check
-	health := &handlers.HealthHandler{DB: db, RDB: rdb, IVSEnabled: ivsSvc.Enabled, S3Enabled: s3Storage.Enabled}
+	health := &handlers.HealthHandler{DB: db, RDB: rdb, IVSEnabled: ivsSvc.Enabled, S3Enabled: s3Storage.Enabled, S3: s3Storage}
 	app.Get("/health", health.Check)
 
 	// Stripe webhook — before body parser; needs raw body intact

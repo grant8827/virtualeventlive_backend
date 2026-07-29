@@ -7,6 +7,8 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+
+	"vertualeventlive/backend/services"
 )
 
 type HealthHandler struct {
@@ -14,6 +16,7 @@ type HealthHandler struct {
 	RDB        *redis.Client
 	IVSEnabled bool
 	S3Enabled  bool
+	S3         *services.S3Storage
 }
 
 func (h *HealthHandler) Check(c *fiber.Ctx) error {
@@ -30,6 +33,14 @@ func (h *HealthHandler) Check(c *fiber.Ctx) error {
 		redisStatus = "error: " + err.Error()
 	}
 
+	s3Status := "not configured"
+	if h.S3 != nil && h.S3Enabled {
+		s3Status = "ok"
+		if err := h.S3.Check(ctx); err != nil {
+			s3Status = "error: " + err.Error()
+		}
+	}
+
 	httpStatus := fiber.StatusOK
 	if dbStatus != "ok" || redisStatus != "ok" {
 		httpStatus = fiber.StatusServiceUnavailable
@@ -41,6 +52,7 @@ func (h *HealthHandler) Check(c *fiber.Ctx) error {
 		"redis":       redisStatus,
 		"ivs_enabled": h.IVSEnabled,
 		"s3_enabled":  h.S3Enabled,
+		"s3":          s3Status,
 		"timestamp":   time.Now().UTC(),
 	})
 }
