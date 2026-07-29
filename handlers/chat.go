@@ -99,6 +99,10 @@ func (h *ChatHub) join(eventID string, cl *chatClient) []chatMessage {
 	return history
 }
 
+// leave drops the client but deliberately keeps the room (and its history/
+// mutes) around even once empty — a brief gap where everyone's disconnected
+// (a viewer refreshing, the host switching tabs) shouldn't wipe scrollback
+// for whoever reconnects or joins next.
 func (h *ChatHub) leave(eventID string, cl *chatClient) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -107,9 +111,6 @@ func (h *ChatHub) leave(eventID string, cl *chatClient) {
 		return
 	}
 	delete(r.clients, cl)
-	if len(r.clients) == 0 {
-		delete(h.rooms, eventID)
-	}
 }
 
 func (h *ChatHub) broadcast(eventID string, msg chatMessage) {
@@ -248,12 +249,11 @@ func (h *ChatHandler) HandleWS(c *websocket.Conn) {
 	for _, m := range h.Hub.join(eventID, cl) {
 		cl.writeJSON(m)
 	}
-	defer func() {
-		h.Hub.leave(eventID, cl)
-		h.Hub.broadcast(eventID, chatMessage{Type: "system", Text: name + " left the chat", At: time.Now().UnixMilli()})
-	}()
-
-	h.Hub.broadcast(eventID, chatMessage{Type: "system", Text: name + " joined the chat", At: time.Now().UnixMilli()})
+	// Deliberately no "X joined/left the chat" broadcast here — every
+	// reconnect (a viewer's flaky wifi, the host just switching tabs) would
+	// spam the room, and "Host left the chat" reads like the host abandoned
+	// the event rather than just closing a panel.
+	defer h.Hub.leave(eventID, cl)
 
 	tokens := chatRateBurst
 	lastRefill := time.Now()
