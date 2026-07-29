@@ -336,7 +336,9 @@ func (h *EventHandler) ListPublic(c *fiber.Ctx) error {
 		`SELECT id, title, event_type, start_time, ends_at,
 		        ticket_price, ticket_type, card_bg_from, card_bg_to, card_bg_image
 		 FROM events
-		 WHERE venue_paid = true AND start_time > NOW()
+		 WHERE venue_paid = true
+		   AND is_active = true
+		   AND ends_at > NOW()
 		 ORDER BY start_time ASC
 		 LIMIT 50`,
 	)
