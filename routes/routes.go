@@ -106,7 +106,7 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	v1.Post("/stream/release", middleware.Protected(cfg.JWTSecret), streamH.Release)
 
 	// Live chat — in-memory per-event room over WebSocket
-	chatH := &handlers.ChatHandler{Hub: handlers.NewChatHub()}
+	chatH := &handlers.ChatHandler{Hub: handlers.NewChatHub(), DB: db, Cfg: cfg}
 	v1.Use("/events/:id/chat/ws", func(c *fiber.Ctx) error {
 		if websocket.IsWebSocketUpgrade(c) {
 			return c.Next()
