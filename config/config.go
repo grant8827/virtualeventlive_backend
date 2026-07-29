@@ -19,6 +19,8 @@ type Config struct {
 	AWSAccessKeyID      string
 	AWSSecretAccessKey  string
 	AWSRegion           string
+	S3BucketName        string
+	S3Region            string
 
 	// WiPay — Caribbean payout rail. Host payouts are sent to WipayAccountNumber
 	// via WipayAPIBaseURL once WiPay confirms their disbursement endpoint contract;
@@ -48,6 +50,8 @@ func Load() *Config {
 		AWSAccessKeyID:      getEnv("AWS_ACCESS_KEY_ID", ""),
 		AWSSecretAccessKey:  getEnv("AWS_SECRET_ACCESS_KEY", ""),
 		AWSRegion:           getEnv("AWS_REGION", "us-east-1"),
+		S3BucketName:        getEnv("S3_BUCKET_NAME", ""),
+		S3Region:            getEnv("S3_REGION", getEnv("AWS_REGION", "us-east-1")),
 
 		WipayAPIBaseURL:  getEnv("WIPAY_API_BASE_URL", ""),
 		WipayAPIKey:      getEnv("WIPAY_API_KEY", ""),

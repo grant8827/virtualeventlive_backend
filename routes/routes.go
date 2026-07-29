@@ -19,9 +19,15 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 		SiteURL:   cfg.FrontendURL,
 	}
 	ivsSvc := services.NewIVSService(cfg.AWSAccessKeyID, cfg.AWSSecretAccessKey, cfg.AWSRegion)
+	s3Storage := services.NewS3Storage(
+		cfg.AWSAccessKeyID,
+		cfg.AWSSecretAccessKey,
+		cfg.S3Region,
+		cfg.S3BucketName,
+	)
 
 	// Health check
-	health := &handlers.HealthHandler{DB: db, RDB: rdb, IVSEnabled: ivsSvc.Enabled}
+	health := &handlers.HealthHandler{DB: db, RDB: rdb, IVSEnabled: ivsSvc.Enabled, S3Enabled: s3Storage.Enabled}
 	app.Get("/health", health.Check)
 
 	// Stripe webhook — before body parser; needs raw body intact
@@ -47,6 +53,13 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	v1.Patch("/events/:id/ticket", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.TicketSetup)
 	v1.Post("/events/:id/bypass-activate", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.BypassActivate)
 	v1.Delete("/events/:id", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.Delete)
+
+	// Private S3-backed event images. Media reads are public because ticket
+	// cards and flyers are public promotional assets; the bucket stays private.
+	imageH := &handlers.ImageHandler{DB: db, Storage: s3Storage}
+	v1.Get("/media/events/:id/:kind", imageH.Get)
+	v1.Post("/events/:id/images/:kind", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), imageH.Upload)
+	v1.Delete("/events/:id/images/:kind", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), imageH.Delete)
 
 	// Advertisements
 	adH := &handlers.AdvertisementHandler{DB: db}

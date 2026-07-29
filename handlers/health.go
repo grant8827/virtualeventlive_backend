@@ -13,6 +13,7 @@ type HealthHandler struct {
 	DB         *pgxpool.Pool
 	RDB        *redis.Client
 	IVSEnabled bool
+	S3Enabled  bool
 }
 
 func (h *HealthHandler) Check(c *fiber.Ctx) error {
@@ -39,6 +40,7 @@ func (h *HealthHandler) Check(c *fiber.Ctx) error {
 		"postgres":    dbStatus,
 		"redis":       redisStatus,
 		"ivs_enabled": h.IVSEnabled,
+		"s3_enabled":  h.S3Enabled,
 		"timestamp":   time.Now().UTC(),
 	})
 }
