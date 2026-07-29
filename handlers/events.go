@@ -219,9 +219,9 @@ func (h *EventHandler) BypassActivate(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"ok": true})
 }
 
-// Delete permanently removes a host-owned event. Related tickets and ledger
-// entries cascade from the event; advertisements are removed explicitly
-// instead of being left orphaned.
+// Delete removes a host-owned event from active/public listings. Issued
+// tickets and financial records are preserved; the event is archived by
+// deactivating it and moving its end time into the past.
 func (h *EventHandler) Delete(c *fiber.Ctx) error {
 	hostID, ok := c.Locals("user_id").(string)
 	if !ok || hostID == "" {
@@ -248,7 +248,9 @@ func (h *EventHandler) Delete(c *fiber.Ctx) error {
 	}
 
 	result, err := tx.Exec(context.Background(),
-		`DELETE FROM events
+		`UPDATE events
+		 SET is_active = false,
+		     ends_at = LEAST(ends_at, NOW())
 		 WHERE id = $1 AND host_id = $2`,
 		eventID, hostID,
 	)
@@ -280,7 +282,7 @@ func (h *EventHandler) ListByHost(c *fiber.Ctx) error {
 		        e.created_at, COUNT(t.id) AS ticket_count
 		 FROM events e
 		 LEFT JOIN tickets t ON t.event_id = e.id
-		 WHERE e.host_id = $1
+		 WHERE e.host_id = $1 AND e.ends_at > NOW()
 		 GROUP BY e.id
 		 ORDER BY e.created_at DESC`,
 		hostID,

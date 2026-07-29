@@ -107,7 +107,10 @@ func (h *AdvertisementHandler) ListPublic(c *fiber.Ctx) error {
 		        a.event_id, e.title AS event_title, a.created_at
 		 FROM advertisements a
 		 JOIN events e ON e.id = a.event_id
-		 WHERE a.is_active = true AND e.start_time > NOW()
+		 WHERE a.is_active = true
+		   AND e.venue_paid = true
+		   AND e.is_active = true
+		   AND e.ends_at > NOW()
 		 ORDER BY a.created_at DESC
 		 LIMIT 20`,
 	)

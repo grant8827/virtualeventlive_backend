@@ -33,7 +33,7 @@ func (h *TicketHandler) ListMine(c *fiber.Ctx) error {
 		        e.id AS event_id, e.title, e.start_time
 		 FROM tickets t
 		 JOIN events e ON e.id = t.event_id
-		 WHERE t.buyer_id = $1 AND e.ends_at > NOW()
+		 WHERE t.buyer_id = $1
 		 ORDER BY t.purchased_at DESC`,
 		buyerID,
 	)
@@ -78,8 +78,7 @@ func (h *TicketHandler) Lookup(c *fiber.Ctx) error {
 		 FROM tickets t
 		 JOIN events e ON e.id = t.event_id
 		 LEFT JOIN users u ON u.id = t.buyer_id
-		 WHERE (u.email = $1 OR t.guest_email = $1)
-		   AND e.ends_at > NOW()
+		 WHERE u.email = $1 OR t.guest_email = $1
 		 ORDER BY t.purchased_at DESC`,
 		email,
 	)
