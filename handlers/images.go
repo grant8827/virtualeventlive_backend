@@ -122,11 +122,15 @@ func (h *ImageHandler) Get(c *fiber.Ctx) error {
 	}
 	defer out.Body.Close()
 
+	data, err := io.ReadAll(io.LimitReader(out.Body, maxImageBytes+1))
+	if err != nil || len(data) == 0 || len(data) > maxImageBytes {
+		return c.SendStatus(fiber.StatusBadGateway)
+	}
 	if out.ContentType != nil {
 		c.Set(fiber.HeaderContentType, *out.ContentType)
 	}
 	c.Set(fiber.HeaderCacheControl, "public, max-age=3600")
-	return c.SendStream(out.Body)
+	return c.Send(data)
 }
 
 func (h *ImageHandler) Delete(c *fiber.Ctx) error {
