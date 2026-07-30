@@ -118,8 +118,10 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	v1.Post("/stream/heartbeat", middleware.Protected(cfg.JWTSecret), streamH.Heartbeat)
 	v1.Post("/stream/release", middleware.Protected(cfg.JWTSecret), streamH.Release)
 
-	// Live chat — in-memory per-event room over WebSocket
-	chatH := &handlers.ChatHandler{Hub: handlers.NewChatHub(), DB: db, Cfg: cfg}
+	// Live chat — ticket-gated registration, Redis-backed history/mutes,
+	// in-process WebSocket fan-out
+	chatH := &handlers.ChatHandler{Hub: handlers.NewChatHub(), DB: db, Cfg: cfg, RDB: rdb}
+	v1.Post("/events/:id/chat/register", chatH.Register)
 	v1.Use("/events/:id/chat/ws", func(c *fiber.Ctx) error {
 		if websocket.IsWebSocketUpgrade(c) {
 			return c.Next()
