@@ -274,6 +274,13 @@ func (h *EventHandler) ListByHost(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
 	}
 
+	dateFilter := "e.ends_at > NOW()"
+	orderBy := "e.start_time ASC"
+	if c.QueryBool("archive") {
+		dateFilter = "e.ends_at <= NOW()"
+		orderBy = "e.ends_at DESC"
+	}
+
 	rows, err := h.DB.Query(context.Background(),
 		`SELECT e.id, e.title, e.event_type, e.start_time, e.ends_at, e.ticket_name,
 		        e.ticket_price, e.ticket_type, e.max_tickets,
@@ -282,9 +289,9 @@ func (h *EventHandler) ListByHost(c *fiber.Ctx) error {
 		        e.created_at, COUNT(t.id) AS ticket_count
 		 FROM events e
 		 LEFT JOIN tickets t ON t.event_id = e.id
-		 WHERE e.host_id = $1 AND e.ends_at > NOW()
+		 WHERE e.host_id = $1 AND `+dateFilter+`
 		 GROUP BY e.id
-		 ORDER BY e.created_at DESC`,
+		 ORDER BY `+orderBy,
 		hostID,
 	)
 	if err != nil {
