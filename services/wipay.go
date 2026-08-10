@@ -16,13 +16,60 @@ import (
 // SendPayout fails closed rather than guessing at a request shape that could
 // silently misroute a host's money.
 type WiPayService struct {
-	APIBaseURL  string
-	APIKey      string
-	Environment string // "sandbox" or "live"
+	AccountNumber string
+	CheckoutURL   string
+	Currency      string
+	APIBaseURL    string
+	APIKey        string
+	Environment   string // "sandbox" or "live"
 }
 
 func (w *WiPayService) Enabled() bool {
 	return w.APIBaseURL != "" && w.APIKey != ""
+}
+
+func (w *WiPayService) CheckoutEnabled() bool {
+	return w.CheckoutURL != "" && w.AccountNumber != "" && w.APIKey != ""
+}
+
+type HostedCheckout struct {
+	Method string            `json:"checkout_method"`
+	URL    string            `json:"checkout_url"`
+	Fields map[string]string `json:"checkout_fields,omitempty"`
+}
+
+type HostedCheckoutRequest struct {
+	Amount      float64
+	Description string
+	Reference   string
+	SuccessURL  string
+	CancelURL   string
+}
+
+func (w *WiPayService) BuildHostedCheckout(req HostedCheckoutRequest) (*HostedCheckout, error) {
+	if !w.CheckoutEnabled() {
+		return nil, fmt.Errorf("wipay checkout not configured")
+	}
+
+	currency := w.Currency
+	if currency == "" {
+		currency = "USD"
+	}
+
+	return &HostedCheckout{
+		Method: http.MethodPost,
+		URL:    w.CheckoutURL,
+		Fields: map[string]string{
+			"account_number": w.AccountNumber,
+			"api_key":        w.APIKey,
+			"amount":         strconv.FormatFloat(req.Amount, 'f', 2, 64),
+			"currency":       currency,
+			"description":    req.Description,
+			"reference":      req.Reference,
+			"success_url":    req.SuccessURL,
+			"cancel_url":     req.CancelURL,
+		},
+	}, nil
 }
 
 // SendPayout pays accountID (the host's WiPay account number) amountUSD.

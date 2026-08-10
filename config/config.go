@@ -11,6 +11,7 @@ type Config struct {
 	JWTSecret           string
 	FrontendURL         string
 	Port                string
+	VenueFeeProvider    string
 	StripeSecretKey     string
 	StripeWebhookSecret string
 	ResendAPIKey        string
@@ -25,9 +26,12 @@ type Config struct {
 	// WiPay — Caribbean payout rail. Host payouts are sent to WipayAccountNumber
 	// via WipayAPIBaseURL once WiPay confirms their disbursement endpoint contract;
 	// unset until then, so payouts stay queued as "pending" rather than firing blind.
-	WipayAPIBaseURL  string
-	WipayAPIKey      string
-	WipayEnvironment string
+	WipayAccountNumber string
+	WipayCheckoutURL   string
+	WipayCurrency      string
+	WipayAPIBaseURL    string
+	WipayAPIKey        string
+	WipayEnvironment   string
 
 	// PayPal — Payouts API (https://developer.paypal.com/docs/payouts/).
 	PaypalClientID     string
@@ -42,6 +46,7 @@ func Load() *Config {
 		JWTSecret:           getEnv("JWT_SECRET", "change-me-in-production"),
 		FrontendURL:         getEnv("FRONTEND_URL", "http://localhost:3000"),
 		Port:                getEnv("PORT", "8080"),
+		VenueFeeProvider:    getEnv("VENUE_FEE_PROVIDER", "auto"),
 		StripeSecretKey:     getEnv("STRIPE_SECRET_KEY", ""),
 		StripeWebhookSecret: getEnv("STRIPE_WEBHOOK_SECRET", ""),
 		ResendAPIKey:        getEnv("RESEND_API_KEY", ""),
@@ -53,9 +58,12 @@ func Load() *Config {
 		S3BucketName:        getEnv("S3_BUCKET_NAME", ""),
 		S3Region:            getEnv("S3_REGION", getEnv("AWS_REGION", "us-east-1")),
 
-		WipayAPIBaseURL:  getEnv("WIPAY_API_BASE_URL", ""),
-		WipayAPIKey:      getEnv("WIPAY_API_KEY", ""),
-		WipayEnvironment: getEnv("WIPAY_ENVIRONMENT", "sandbox"),
+		WipayAccountNumber: getEnv("WIPAY_ACCOUNT_NUMBER", ""),
+		WipayCheckoutURL:   getEnv("WIPAY_CHECKOUT_URL", ""),
+		WipayCurrency:      getEnv("WIPAY_CURRENCY", "USD"),
+		WipayAPIBaseURL:    getEnv("WIPAY_API_BASE_URL", ""),
+		WipayAPIKey:        getEnv("WIPAY_API_KEY", ""),
+		WipayEnvironment:   getEnv("WIPAY_ENVIRONMENT", "sandbox"),
 
 		PaypalClientID:     getEnv("PAYPAL_CLIENT_ID", ""),
 		PaypalClientSecret: getEnv("PAYPAL_CLIENT_SECRET", ""),
@@ -80,4 +88,21 @@ func getFloat(key string, fallback float64) float64 {
 		return fallback
 	}
 	return f
+}
+
+func (c *Config) MissingS3EnvKeys() []string {
+	missing := []string{}
+	if c.AWSAccessKeyID == "" {
+		missing = append(missing, "AWS_ACCESS_KEY_ID")
+	}
+	if c.AWSSecretAccessKey == "" {
+		missing = append(missing, "AWS_SECRET_ACCESS_KEY")
+	}
+	if c.S3BucketName == "" {
+		missing = append(missing, "S3_BUCKET_NAME")
+	}
+	if c.S3Region == "" {
+		missing = append(missing, "S3_REGION")
+	}
+	return missing
 }

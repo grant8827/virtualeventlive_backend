@@ -27,7 +27,14 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	)
 
 	// Health check
-	health := &handlers.HealthHandler{DB: db, RDB: rdb, IVSEnabled: ivsSvc.Enabled, S3Enabled: s3Storage.Enabled, S3: s3Storage}
+	health := &handlers.HealthHandler{
+		DB:         db,
+		RDB:        rdb,
+		IVSEnabled: ivsSvc.Enabled,
+		S3Enabled:  s3Storage.Enabled,
+		S3:         s3Storage,
+		S3Missing:  cfg.MissingS3EnvKeys(),
+	}
 	app.Get("/health", health.Check)
 
 	// Stripe webhook — before body parser; needs raw body intact
@@ -44,12 +51,26 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	v1.Get("/auth/me", middleware.Protected(cfg.JWTSecret), authH.Me)
 
 	// Events
-	eventH := &handlers.EventHandler{DB: db, Cfg: cfg}
+	eventH := &handlers.EventHandler{
+		DB:  db,
+		Cfg: cfg,
+		IVS: ivsSvc,
+		WiPay: &services.WiPayService{
+			AccountNumber: cfg.WipayAccountNumber,
+			CheckoutURL:   cfg.WipayCheckoutURL,
+			Currency:      cfg.WipayCurrency,
+			APIBaseURL:    cfg.WipayAPIBaseURL,
+			APIKey:        cfg.WipayAPIKey,
+			Environment:   cfg.WipayEnvironment,
+		},
+	}
 	v1.Get("/events/public", eventH.ListPublic)
 	v1.Get("/events/:id", eventH.GetByID)
+	v1.Get("/events/:id/wipay/launch", eventH.WiPayLaunch)
 	v1.Post("/events", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.Create)
 	v1.Get("/events", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.ListByHost)
 	v1.Post("/events/:id/checkout", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.Checkout)
+	v1.Get("/events/:id/wipay/complete", eventH.WiPayComplete)
 	v1.Patch("/events/:id/ticket", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.TicketSetup)
 	v1.Post("/events/:id/bypass-activate", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.BypassActivate)
 	v1.Delete("/events/:id", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.Delete)
@@ -110,6 +131,8 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	v1.Post("/tickets/guest-purchase", ticketH.GuestPurchase)
 	v1.Post("/tickets/purchase", middleware.Protected(cfg.JWTSecret), ticketH.Purchase)
 	v1.Get("/tickets/mine", middleware.Protected(cfg.JWTSecret), ticketH.ListMine)
+	// Door-scanner check-in — host only, used by the dashboard's Scan Tickets page
+	v1.Post("/tickets/checkin", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), ticketH.CheckIn)
 
 	// Viewer stream — Redis session locking
 	guard := &services.SessionGuard{RDB: rdb}

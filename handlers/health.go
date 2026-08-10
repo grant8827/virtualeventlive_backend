@@ -17,6 +17,7 @@ type HealthHandler struct {
 	IVSEnabled bool
 	S3Enabled  bool
 	S3         *services.S3Storage
+	S3Missing  []string
 }
 
 func (h *HealthHandler) Check(c *fiber.Ctx) error {
@@ -47,12 +48,13 @@ func (h *HealthHandler) Check(c *fiber.Ctx) error {
 	}
 
 	return c.Status(httpStatus).JSON(fiber.Map{
-		"status":      "vertualeventlive api",
-		"postgres":    dbStatus,
-		"redis":       redisStatus,
-		"ivs_enabled": h.IVSEnabled,
-		"s3_enabled":  h.S3Enabled,
-		"s3":          s3Status,
-		"timestamp":   time.Now().UTC(),
+		"status":         "vertualeventlive api",
+		"postgres":       dbStatus,
+		"redis":          redisStatus,
+		"ivs_enabled":    h.IVSEnabled,
+		"s3_enabled":     h.S3Enabled,
+		"s3":             s3Status,
+		"s3_missing_env": h.S3Missing,
+		"timestamp":      time.Now().UTC(),
 	})
 }

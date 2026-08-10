@@ -2,8 +2,6 @@ package handlers
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -130,40 +128,7 @@ func (h *StripeHandler) handleVenueFeePaid(sess *stripe.CheckoutSession) error {
 	if eventID == "" {
 		return nil
 	}
-
-	// Mark event as paid and active
-	if _, err := h.DB.Exec(context.Background(),
-		`UPDATE events SET venue_paid = true, is_active = true WHERE id = $1`,
-		eventID,
-	); err != nil {
-		return err
-	}
-
-	// Provision IVS channel if AWS is configured
-	if h.IVS.Enabled {
-		var title string
-		_ = h.DB.QueryRow(context.Background(),
-			`SELECT title FROM events WHERE id = $1`, eventID,
-		).Scan(&title)
-
-		creds, err := h.IVS.ProvisionChannel(context.Background(), title)
-		if err != nil {
-			fmt.Printf("IVS provision failed (non-fatal): %v\n", err)
-			return nil
-		}
-
-		_, _ = h.DB.Exec(context.Background(),
-			`UPDATE events SET
-				aws_channel_arn   = $1,
-				stream_ingest_url = $2,
-				stream_key_value  = $3,
-				aws_playback_url  = $4
-			 WHERE id = $5`,
-			creds.ChannelARN, creds.IngestURL, creds.StreamKey, creds.PlaybackURL, eventID,
-		)
-	}
-
-	return nil
+	return activateVenuePaidEvent(context.Background(), h.DB, h.IVS, eventID)
 }
 
 func (h *StripeHandler) handleTicketPurchase(sess *stripe.CheckoutSession) error {
@@ -201,9 +166,7 @@ func (h *StripeHandler) handleTicketPurchase(sess *stripe.CheckoutSession) error
 		}
 	}
 
-	tokenBytes := make([]byte, 16)
-	rand.Read(tokenBytes)
-	accessToken := "TCK-" + hex.EncodeToString(tokenBytes)
+	accessToken := services.GenerateTicketCode()
 
 	var ticketID string
 	var insertErr error

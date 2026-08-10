@@ -2,20 +2,36 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"math"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	stripe "github.com/stripe/stripe-go/v82"
 	"github.com/stripe/stripe-go/v82/checkout/session"
 
 	"vertualeventlive/backend/config"
+	"vertualeventlive/backend/services"
 )
 
 type EventHandler struct {
-	DB  *pgxpool.Pool
-	Cfg *config.Config
+	DB    *pgxpool.Pool
+	Cfg   *config.Config
+	IVS   *services.IVSService
+	WiPay *services.WiPayService
+}
+
+// nullIfEmpty maps "" to a real SQL NULL instead of storing an empty string,
+// so an unset optional text column reads back as nil rather than "".
+func nullIfEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
 
 type createEventRequest struct {
@@ -101,7 +117,30 @@ func (h *EventHandler) Checkout(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "venue fee already paid"})
 	}
 
-	// Stripe not configured — bypass payment and mark event as paid directly
+	provider := strings.ToLower(strings.TrimSpace(h.Cfg.VenueFeeProvider))
+	if provider == "" {
+		provider = "auto"
+	}
+
+	if provider == "wipay" || (provider == "auto" && h.WiPay != nil && h.WiPay.CheckoutEnabled()) {
+		state, err := h.signVenueFeeState(eventID, hostID, venueFee)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to prepare WiPay checkout"})
+		}
+
+		launchURL := fmt.Sprintf("%s/api/v1/events/%s/wipay/launch?state=%s",
+			strings.TrimRight(c.BaseURL(), "/"),
+			url.PathEscape(eventID),
+			url.QueryEscape(state),
+		)
+
+		return c.JSON(fiber.Map{
+			"checkout_provider": "wipay",
+			"checkout_url":      launchURL,
+		})
+	}
+
+	// No payment provider configured — bypass payment and mark event as paid directly
 	if h.Cfg.StripeSecretKey == "" {
 		if _, err := h.DB.Exec(context.Background(),
 			`UPDATE events SET venue_paid = true, is_active = true WHERE id = $1`, eventID,
@@ -145,13 +184,155 @@ func (h *EventHandler) Checkout(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"checkout_url": s.URL})
 }
 
+func (h *EventHandler) WiPayLaunch(c *fiber.Ctx) error {
+	eventID := c.Params("id")
+	state := c.Query("state")
+	if state == "" {
+		return c.Status(fiber.StatusBadRequest).SendString("missing WiPay state")
+	}
+
+	var (
+		hostID   string
+		title    string
+		venueFee float64
+	)
+	if err := h.DB.QueryRow(context.Background(),
+		`SELECT host_id, title, venue_fee FROM events WHERE id = $1`,
+		eventID,
+	).Scan(&hostID, &title, &venueFee); err != nil {
+		return c.Status(fiber.StatusNotFound).SendString("event not found")
+	}
+
+	if err := h.verifyVenueFeeState(state, eventID, hostID, venueFee); err != nil {
+		return c.Status(fiber.StatusUnauthorized).SendString("invalid WiPay state")
+	}
+
+	successURL := fmt.Sprintf("%s/api/v1/events/%s/wipay/complete?state=%s",
+		strings.TrimRight(c.BaseURL(), "/"),
+		url.PathEscape(eventID),
+		url.QueryEscape(state),
+	)
+	cancelURL := h.Cfg.FrontendURL + "/dashboard"
+
+	checkout, err := h.WiPay.BuildHostedCheckout(services.HostedCheckoutRequest{
+		Amount:      venueFee,
+		Description: "VirtualEventLive venue fee - " + title,
+		Reference:   "venue_fee:" + eventID,
+		SuccessURL:  successURL,
+		CancelURL:   cancelURL,
+	})
+	if err != nil {
+		return c.Status(fiber.StatusBadGateway).SendString(err.Error())
+	}
+
+	return c.Type("html").SendString(renderHostedCheckoutHTML(checkout))
+}
+
+func (h *EventHandler) WiPayComplete(c *fiber.Ctx) error {
+	eventID := c.Params("id")
+	state := c.Query("state")
+	if state == "" {
+		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
+	}
+
+	var (
+		hostID   string
+		venueFee float64
+	)
+	if err := h.DB.QueryRow(context.Background(),
+		`SELECT host_id, venue_fee FROM events WHERE id = $1`,
+		eventID,
+	).Scan(&hostID, &venueFee); err != nil {
+		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
+	}
+
+	if err := h.verifyVenueFeeState(state, eventID, hostID, venueFee); err != nil {
+		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
+	}
+
+	status := strings.ToLower(strings.TrimSpace(c.Query("status")))
+	if strings.Contains(status, "cancel") || strings.Contains(status, "fail") {
+		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
+	}
+
+	if err := activateVenuePaidEvent(context.Background(), h.DB, h.IVS, eventID); err != nil {
+		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
+	}
+
+	return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=1")
+}
+
+func (h *EventHandler) signVenueFeeState(eventID, hostID string, venueFee float64) (string, error) {
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"event_id":     eventID,
+		"host_id":      hostID,
+		"amount_cents": int64(math.Round(venueFee * 100)),
+		"exp":          time.Now().Add(30 * time.Minute).Unix(),
+	})
+	return token.SignedString([]byte(h.Cfg.JWTSecret))
+}
+
+func (h *EventHandler) verifyVenueFeeState(tokenString, eventID, hostID string, venueFee float64) error {
+	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (any, error) {
+		return []byte(h.Cfg.JWTSecret), nil
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
+	if err != nil || !token.Valid {
+		return fmt.Errorf("invalid state token")
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return fmt.Errorf("invalid state claims")
+	}
+	if claims["event_id"] != eventID || claims["host_id"] != hostID {
+		return fmt.Errorf("state mismatch")
+	}
+
+	amountCents, ok := claims["amount_cents"].(float64)
+	if !ok || int64(amountCents) != int64(math.Round(venueFee*100)) {
+		return fmt.Errorf("amount mismatch")
+	}
+
+	return nil
+}
+
+func renderHostedCheckoutHTML(checkout *services.HostedCheckout) string {
+	var body strings.Builder
+	body.WriteString("<!doctype html><html><head><meta charset=\"utf-8\"><title>Redirecting to WiPay</title></head><body>")
+	body.WriteString("<form id=\"wipay-checkout\" method=\"")
+	body.WriteString(checkout.Method)
+	body.WriteString("\" action=\"")
+	body.WriteString(templateEscape(checkout.URL))
+	body.WriteString("\">")
+	for key, value := range checkout.Fields {
+		body.WriteString("<input type=\"hidden\" name=\"")
+		body.WriteString(templateEscape(key))
+		body.WriteString("\" value=\"")
+		body.WriteString(templateEscape(value))
+		body.WriteString("\">")
+	}
+	body.WriteString("</form><p>Redirecting to WiPay...</p><script>document.getElementById('wipay-checkout').submit()</script></body></html>")
+	return body.String()
+}
+
+func templateEscape(value string) string {
+	replacer := strings.NewReplacer(
+		"&", "&amp;",
+		`"`, "&quot;",
+		"<", "&lt;",
+		">", "&gt;",
+	)
+	return replacer.Replace(value)
+}
+
 type ticketSetupRequest struct {
-	TicketName  string  `json:"ticket_name"`
-	TicketPrice float64 `json:"ticket_price"`
-	TicketType  string  `json:"ticket_type"`
-	CardBgFrom  string  `json:"card_bg_from"`
-	CardBgTo    string  `json:"card_bg_to"`
-	CardBgImage string  `json:"card_bg_image"`
+	TicketName   string  `json:"ticket_name"`
+	TicketPrice  float64 `json:"ticket_price"`
+	TicketType   string  `json:"ticket_type"`
+	CardBgFrom   string  `json:"card_bg_from"`
+	CardBgTo     string  `json:"card_bg_to"`
+	CardBgImage  string  `json:"card_bg_image"`
+	VenueAddress string  `json:"venue_address"`
 }
 
 func (h *EventHandler) TicketSetup(c *fiber.Ctx) error {
@@ -181,14 +362,18 @@ func (h *EventHandler) TicketSetup(c *fiber.Ctx) error {
 	if req.TicketType == "" {
 		req.TicketType = "Virtual Only"
 	}
+	// Address only makes sense once there's a physical door to check in at.
+	if req.TicketType != "Virtual + Location" {
+		req.VenueAddress = ""
+	}
 
 	result, err := h.DB.Exec(context.Background(),
 		`UPDATE events
 		 SET ticket_name = $1, ticket_price = $2, ticket_type = $3,
-		     card_bg_from = $4, card_bg_to = $5, card_bg_image = $6
-		 WHERE id = $7 AND host_id = $8 AND ends_at > NOW()`,
+		     card_bg_from = $4, card_bg_to = $5, card_bg_image = $6, venue_address = $7
+		 WHERE id = $8 AND host_id = $9 AND ends_at > NOW()`,
 		req.TicketName, req.TicketPrice, req.TicketType,
-		req.CardBgFrom, req.CardBgTo, req.CardBgImage,
+		req.CardBgFrom, req.CardBgTo, req.CardBgImage, nullIfEmpty(req.VenueAddress),
 		eventID, hostID,
 	)
 	if err != nil || result.RowsAffected() == 0 {
@@ -284,7 +469,7 @@ func (h *EventHandler) ListByHost(c *fiber.Ctx) error {
 	rows, err := h.DB.Query(context.Background(),
 		`SELECT e.id, e.title, e.event_type, e.start_time, e.ends_at, e.ticket_name,
 		        e.ticket_price, e.ticket_type, e.max_tickets,
-		        e.card_bg_from, e.card_bg_to, e.card_bg_image,
+		        e.card_bg_from, e.card_bg_to, e.card_bg_image, e.venue_address,
 		        e.venue_fee, e.venue_paid, e.is_active, (e.ends_at < NOW()) AS expired,
 		        e.created_at, COUNT(t.id) AS ticket_count
 		 FROM events e
@@ -300,24 +485,25 @@ func (h *EventHandler) ListByHost(c *fiber.Ctx) error {
 	defer rows.Close()
 
 	type eventRow struct {
-		ID          string     `json:"id"`
-		Title       string     `json:"title"`
-		EventType   string     `json:"event_type"`
-		StartsAt    time.Time  `json:"starts_at"`
-		EndsAt      *time.Time `json:"ends_at"`
-		TicketName  string     `json:"ticket_name"`
-		TicketPrice float64    `json:"ticket_price"`
-		TicketType  string     `json:"ticket_type"`
-		MaxTickets  *int       `json:"max_tickets"`
-		CardBgFrom  string     `json:"card_bg_from"`
-		CardBgTo    string     `json:"card_bg_to"`
-		CardBgImage *string    `json:"card_bg_image"`
-		VenueFee    float64    `json:"venue_fee"`
-		VenuePaid   bool       `json:"venue_paid"`
-		IsActive    bool       `json:"is_active"`
-		Expired     bool       `json:"expired"`
-		CreatedAt   time.Time  `json:"created_at"`
-		TicketCount int        `json:"ticket_count"`
+		ID           string     `json:"id"`
+		Title        string     `json:"title"`
+		EventType    string     `json:"event_type"`
+		StartsAt     time.Time  `json:"starts_at"`
+		EndsAt       *time.Time `json:"ends_at"`
+		TicketName   string     `json:"ticket_name"`
+		TicketPrice  float64    `json:"ticket_price"`
+		TicketType   string     `json:"ticket_type"`
+		MaxTickets   *int       `json:"max_tickets"`
+		CardBgFrom   string     `json:"card_bg_from"`
+		CardBgTo     string     `json:"card_bg_to"`
+		CardBgImage  *string    `json:"card_bg_image"`
+		VenueAddress *string    `json:"venue_address"`
+		VenueFee     float64    `json:"venue_fee"`
+		VenuePaid    bool       `json:"venue_paid"`
+		IsActive     bool       `json:"is_active"`
+		Expired      bool       `json:"expired"`
+		CreatedAt    time.Time  `json:"created_at"`
+		TicketCount  int        `json:"ticket_count"`
 	}
 
 	events := []eventRow{}
@@ -326,7 +512,7 @@ func (h *EventHandler) ListByHost(c *fiber.Ctx) error {
 		if err := rows.Scan(
 			&e.ID, &e.Title, &e.EventType, &e.StartsAt, &e.EndsAt, &e.TicketName,
 			&e.TicketPrice, &e.TicketType, &e.MaxTickets,
-			&e.CardBgFrom, &e.CardBgTo, &e.CardBgImage,
+			&e.CardBgFrom, &e.CardBgTo, &e.CardBgImage, &e.VenueAddress,
 			&e.VenueFee, &e.VenuePaid, &e.IsActive, &e.Expired,
 			&e.CreatedAt, &e.TicketCount,
 		); err != nil {
@@ -343,7 +529,7 @@ func (h *EventHandler) ListByHost(c *fiber.Ctx) error {
 func (h *EventHandler) ListPublic(c *fiber.Ctx) error {
 	rows, err := h.DB.Query(context.Background(),
 		`SELECT id, title, event_type, start_time, ends_at,
-		        ticket_price, ticket_type, card_bg_from, card_bg_to, card_bg_image
+		        ticket_price, ticket_type, card_bg_from, card_bg_to, card_bg_image, venue_address
 		 FROM events
 		 WHERE venue_paid = true
 		   AND is_active = true
@@ -357,16 +543,17 @@ func (h *EventHandler) ListPublic(c *fiber.Ctx) error {
 	defer rows.Close()
 
 	type publicEvent struct {
-		ID          string     `json:"id"`
-		Title       string     `json:"title"`
-		EventType   string     `json:"event_type"`
-		StartsAt    time.Time  `json:"starts_at"`
-		EndsAt      *time.Time `json:"ends_at"`
-		TicketPrice float64    `json:"ticket_price"`
-		TicketType  string     `json:"ticket_type"`
-		CardBgFrom  string     `json:"card_bg_from"`
-		CardBgTo    string     `json:"card_bg_to"`
-		CardBgImage *string    `json:"card_bg_image"`
+		ID           string     `json:"id"`
+		Title        string     `json:"title"`
+		EventType    string     `json:"event_type"`
+		StartsAt     time.Time  `json:"starts_at"`
+		EndsAt       *time.Time `json:"ends_at"`
+		TicketPrice  float64    `json:"ticket_price"`
+		TicketType   string     `json:"ticket_type"`
+		CardBgFrom   string     `json:"card_bg_from"`
+		CardBgTo     string     `json:"card_bg_to"`
+		CardBgImage  *string    `json:"card_bg_image"`
+		VenueAddress *string    `json:"venue_address"`
 	}
 
 	events := []publicEvent{}
@@ -374,7 +561,7 @@ func (h *EventHandler) ListPublic(c *fiber.Ctx) error {
 		var e publicEvent
 		if err := rows.Scan(
 			&e.ID, &e.Title, &e.EventType, &e.StartsAt, &e.EndsAt,
-			&e.TicketPrice, &e.TicketType, &e.CardBgFrom, &e.CardBgTo, &e.CardBgImage,
+			&e.TicketPrice, &e.TicketType, &e.CardBgFrom, &e.CardBgTo, &e.CardBgImage, &e.VenueAddress,
 		); err != nil {
 			continue
 		}
@@ -388,25 +575,27 @@ func (h *EventHandler) GetByID(c *fiber.Ctx) error {
 	id := c.Params("id")
 
 	var (
-		eventID     string
-		hostID      string
-		title       string
-		description string
-		startsAt    time.Time
-		endsAt      *time.Time
-		ticketPrice float64
-		isActive    bool
-		playbackURL *string
-		createdAt   time.Time
+		eventID      string
+		hostID       string
+		title        string
+		description  string
+		startsAt     time.Time
+		endsAt       *time.Time
+		ticketPrice  float64
+		ticketType   string
+		venueAddress *string
+		isActive     bool
+		playbackURL  *string
+		createdAt    time.Time
 	)
 
 	err := h.DB.QueryRow(context.Background(),
 		`SELECT id, host_id, title, description, start_time, ends_at,
-		        ticket_price, is_active, aws_playback_url, created_at
+		        ticket_price, ticket_type, venue_address, is_active, aws_playback_url, created_at
 		 FROM events WHERE id = $1`,
 		id,
 	).Scan(&eventID, &hostID, &title, &description, &startsAt, &endsAt,
-		&ticketPrice, &isActive, &playbackURL, &createdAt)
+		&ticketPrice, &ticketType, &venueAddress, &isActive, &playbackURL, &createdAt)
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "event not found"})
 	}
@@ -421,6 +610,8 @@ func (h *EventHandler) GetByID(c *fiber.Ctx) error {
 		"starts_at":        startsAt,
 		"ends_at":          endsAt,
 		"ticket_price":     ticketPrice,
+		"ticket_type":      ticketType,
+		"venue_address":    venueAddress,
 		"is_active":        isActive,
 		"expired":          expired,
 		"aws_playback_url": playbackURL,

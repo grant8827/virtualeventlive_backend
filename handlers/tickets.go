@@ -2,8 +2,6 @@ package handlers
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"strings"
 	"time"
 
@@ -29,8 +27,10 @@ func (h *TicketHandler) ListMine(c *fiber.Ctx) error {
 	}
 
 	rows, err := h.DB.Query(context.Background(),
-		`SELECT t.id, t.access_token, t.purchased_at,
-		        e.id AS event_id, e.title, e.start_time
+		`SELECT t.id, t.access_token, t.serial_no, t.purchased_at,
+		        t.checked_in_at, t.checked_in_channel,
+		        e.id AS event_id, e.title, e.start_time, e.ticket_type, e.ticket_price,
+		        e.card_bg_from, e.card_bg_to, e.card_bg_image, e.venue_address
 		 FROM tickets t
 		 JOIN events e ON e.id = t.event_id
 		 WHERE t.buyer_id = $1
@@ -42,26 +42,42 @@ func (h *TicketHandler) ListMine(c *fiber.Ctx) error {
 	}
 	defer rows.Close()
 
-	type ticketRow struct {
-		ID            string    `json:"id"`
-		AccessToken   string    `json:"access_token"`
-		PurchasedAt   time.Time `json:"purchased_at"`
-		EventID       string    `json:"event_id"`
-		EventTitle    string    `json:"event_title"`
-		EventStartsAt time.Time `json:"event_starts_at"`
-	}
-
 	tickets := []ticketRow{}
 	for rows.Next() {
 		var t ticketRow
-		if err := rows.Scan(&t.ID, &t.AccessToken, &t.PurchasedAt,
-			&t.EventID, &t.EventTitle, &t.EventStartsAt); err != nil {
+		if err := rows.Scan(&t.ID, &t.AccessToken, &t.SerialNo, &t.PurchasedAt,
+			&t.CheckedInAt, &t.CheckedInChannel,
+			&t.EventID, &t.EventTitle, &t.EventStartsAt, &t.TicketType, &t.TicketPrice,
+			&t.CardBgFrom, &t.CardBgTo, &t.CardBgImage, &t.VenueAddress); err != nil {
 			continue
 		}
 		tickets = append(tickets, t)
 	}
 
 	return c.JSON(fiber.Map{"tickets": tickets})
+}
+
+// ticketRow is the shape returned to buyers by both ListMine and Lookup —
+// everything the ticket UI needs to render the full visual ticket
+// (TicketCard on the frontend), not just the bare access code.
+type ticketRow struct {
+	ID               string     `json:"id"`
+	AccessToken      string     `json:"access_token"`
+	SerialNo         int64      `json:"serial_no"`
+	PurchasedAt      time.Time  `json:"purchased_at"`
+	CheckedInAt      *time.Time `json:"checked_in_at"`
+	CheckedInChannel *string    `json:"checked_in_channel"`
+	EventID          string     `json:"event_id"`
+	EventTitle       string     `json:"event_title"`
+	EventStartsAt    time.Time  `json:"event_starts_at"`
+	TicketType       string     `json:"ticket_type"`
+	TicketPrice      float64    `json:"ticket_price"`
+	CardBgFrom       string     `json:"card_bg_from"`
+	CardBgTo         string     `json:"card_bg_to"`
+	CardBgImage      *string    `json:"card_bg_image"`
+	VenueAddress     *string    `json:"venue_address"`
+	EventIsActive    bool       `json:"event_is_active"`
+	EventExpired     bool       `json:"event_expired"`
 }
 
 // Lookup is a public endpoint — buyers retrieve their tickets by email address.
@@ -73,8 +89,11 @@ func (h *TicketHandler) Lookup(c *fiber.Ctx) error {
 	}
 
 	rows, err := h.DB.Query(context.Background(),
-		`SELECT t.id, t.access_token, t.purchased_at,
-		        e.id AS event_id, e.title, e.start_time, e.is_active, e.ends_at, e.card_bg_image
+		`SELECT t.id, t.access_token, t.serial_no, t.purchased_at,
+		        t.checked_in_at, t.checked_in_channel,
+		        e.id AS event_id, e.title, e.start_time, e.ticket_type, e.ticket_price,
+		        e.card_bg_from, e.card_bg_to, e.card_bg_image, e.venue_address,
+		        e.is_active, e.ends_at
 		 FROM tickets t
 		 JOIN events e ON e.id = t.event_id
 		 LEFT JOIN users u ON u.id = t.buyer_id
@@ -87,24 +106,15 @@ func (h *TicketHandler) Lookup(c *fiber.Ctx) error {
 	}
 	defer rows.Close()
 
-	type ticketRow struct {
-		ID            string    `json:"id"`
-		AccessToken   string    `json:"access_token"`
-		PurchasedAt   time.Time `json:"purchased_at"`
-		EventID       string    `json:"event_id"`
-		EventTitle    string    `json:"event_title"`
-		EventStartsAt time.Time `json:"event_starts_at"`
-		EventIsActive bool      `json:"event_is_active"`
-		EventExpired  bool      `json:"event_expired"`
-		CardBgImage   *string   `json:"card_bg_image"`
-	}
-
 	tickets := []ticketRow{}
 	for rows.Next() {
 		var t ticketRow
 		var endsAt time.Time
-		if err := rows.Scan(&t.ID, &t.AccessToken, &t.PurchasedAt,
-			&t.EventID, &t.EventTitle, &t.EventStartsAt, &t.EventIsActive, &endsAt, &t.CardBgImage); err != nil {
+		if err := rows.Scan(&t.ID, &t.AccessToken, &t.SerialNo, &t.PurchasedAt,
+			&t.CheckedInAt, &t.CheckedInChannel,
+			&t.EventID, &t.EventTitle, &t.EventStartsAt, &t.TicketType, &t.TicketPrice,
+			&t.CardBgFrom, &t.CardBgTo, &t.CardBgImage, &t.VenueAddress,
+			&t.EventIsActive, &endsAt); err != nil {
 			continue
 		}
 		t.EventExpired = time.Now().After(endsAt)
@@ -125,19 +135,22 @@ func (h *TicketHandler) Enter(c *fiber.Ctx) error {
 	}
 
 	var (
-		eventID     string
-		eventTitle  string
-		isActive    bool
-		endsAt      time.Time
-		playbackURL *string
+		ticketID         string
+		eventID          string
+		eventTitle       string
+		isActive         bool
+		endsAt           time.Time
+		playbackURL      *string
+		ticketType       string
+		checkedInChannel *string
 	)
 	err := h.DB.QueryRow(context.Background(),
-		`SELECT e.id, e.title, e.is_active, e.ends_at, e.aws_playback_url
+		`SELECT t.id, e.id, e.title, e.is_active, e.ends_at, e.aws_playback_url, e.ticket_type, t.checked_in_channel
 		 FROM tickets t
 		 JOIN events e ON e.id = t.event_id
 		 WHERE t.access_token = $1`,
 		code,
-	).Scan(&eventID, &eventTitle, &isActive, &endsAt, &playbackURL)
+	).Scan(&ticketID, &eventID, &eventTitle, &isActive, &endsAt, &playbackURL, &ticketType, &checkedInChannel)
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "ticket not found"})
 	}
@@ -149,6 +162,25 @@ func (h *TicketHandler) Enter(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "This event is not active yet."})
 	}
 
+	// "Virtual + Location" tickets are single-use across channels: whichever
+	// of "watch online" or "scan in at the door" happens first claims the
+	// ticket, and the other channel is then locked out. Re-entering here on
+	// the SAME channel (e.g. reloading the Watch page) stays unaffected —
+	// it's only a first-claim marker, not a one-time-only gate for virtual.
+	if ticketType == "Virtual + Location" {
+		if checkedInChannel != nil && *checkedInChannel == "physical" {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "This ticket was already used to check in at the venue."})
+		}
+		if checkedInChannel == nil {
+			if _, err := h.DB.Exec(context.Background(),
+				`UPDATE tickets SET checked_in_at = NOW(), checked_in_channel = 'virtual' WHERE id = $1`,
+				ticketID,
+			); err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to record entry"})
+			}
+		}
+	}
+
 	resp := fiber.Map{
 		"event_id":    eventID,
 		"event_title": eventTitle,
@@ -158,6 +190,90 @@ func (h *TicketHandler) Enter(c *fiber.Ctx) error {
 		resp["playback_url"] = *playbackURL
 	}
 	return c.JSON(resp)
+}
+
+type checkinRequest struct {
+	Code string `json:"code"`
+}
+
+// CheckIn is the dashboard door-scanner's endpoint: a host scans a ticket's
+// QR code (or types its serial number in as a manual fallback) to admit a
+// "Virtual + Location" ticket holder in person. Tickets are single-use
+// across channels — see Enter — so a ticket already claimed by the virtual
+// stream is rejected here too, and vice versa.
+func (h *TicketHandler) CheckIn(c *fiber.Ctx) error {
+	hostID, ok := c.Locals("user_id").(string)
+	if !ok || hostID == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+
+	var req checkinRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	}
+	code := strings.TrimSpace(req.Code)
+	if code == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "code is required"})
+	}
+
+	// The QR payload and the printed serial fallback are the same value, so
+	// staff can scan or type either one. Accept a raw access_token too, in
+	// case someone reads it off the viewing-code half of the stub instead.
+	var (
+		ticketID         string
+		serialNo         int64
+		eventTitle       string
+		eventHostID      string
+		ticketType       string
+		checkedInAt      *time.Time
+		checkedInChannel *string
+	)
+	err := h.DB.QueryRow(context.Background(),
+		`SELECT t.id, t.serial_no, e.title, e.host_id, e.ticket_type, t.checked_in_at, t.checked_in_channel
+		 FROM tickets t
+		 JOIN events e ON e.id = t.event_id
+		 WHERE t.serial_no::text = $1 OR t.access_token = $1`,
+		code,
+	).Scan(&ticketID, &serialNo, &eventTitle, &eventHostID, &ticketType, &checkedInAt, &checkedInChannel)
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Ticket not found."})
+	}
+
+	if eventHostID != hostID {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "This ticket belongs to a different host's event."})
+	}
+	if ticketType != "Virtual + Location" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "This is a virtual-only ticket — it doesn't need a door check-in."})
+	}
+
+	if checkedInChannel != nil {
+		usedWhere := "at the door"
+		if *checkedInChannel == "virtual" {
+			usedWhere = "on the live stream"
+		}
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"error":         "Ticket already used — " + usedWhere + ".",
+			"used":          true,
+			"channel":       *checkedInChannel,
+			"checked_in_at": checkedInAt,
+			"event_title":   eventTitle,
+			"serial_no":     serialNo,
+		})
+	}
+
+	if _, err := h.DB.Exec(context.Background(),
+		`UPDATE tickets SET checked_in_at = NOW(), checked_in_channel = 'physical' WHERE id = $1`,
+		ticketID,
+	); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to record check-in"})
+	}
+
+	return c.JSON(fiber.Map{
+		"ok":          true,
+		"used":        false,
+		"event_title": eventTitle,
+		"serial_no":   serialNo,
+	})
 }
 
 type guestPurchaseRequest struct {
@@ -196,9 +312,7 @@ func (h *TicketHandler) GuestPurchase(c *fiber.Ctx) error {
 
 	// Dev bypass — Stripe not configured
 	if h.Cfg.StripeSecretKey == "" || ticketPrice == 0 {
-		tokenBytes := make([]byte, 16)
-		rand.Read(tokenBytes)
-		accessToken := "TCK-" + hex.EncodeToString(tokenBytes)
+		accessToken := services.GenerateTicketCode()
 
 		if _, err := h.DB.Exec(context.Background(),
 			`INSERT INTO tickets (event_id, buyer_id, guest_email, access_token) VALUES ($1, NULL, $2, $3)`,
