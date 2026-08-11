@@ -188,6 +188,9 @@ func (h *EventHandler) WiPayLaunch(c *fiber.Ctx) error {
 	eventID := c.Params("id")
 	state := c.Query("state")
 	if state == "" {
+		state = c.FormValue("state")
+	}
+	if state == "" {
 		return c.Status(fiber.StatusBadRequest).SendString("missing WiPay state")
 	}
 

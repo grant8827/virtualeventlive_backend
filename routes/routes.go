@@ -67,6 +67,9 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	v1.Get("/events/public", eventH.ListPublic)
 	v1.Get("/events/:id", eventH.GetByID)
 	v1.Get("/events/:id/wipay/launch", eventH.WiPayLaunch)
+	// Some hosted-checkout handoffs submit the launch URL as a form POST.
+	// The signed state still authorizes the request in either form.
+	v1.Post("/events/:id/wipay/launch", eventH.WiPayLaunch)
 	v1.Post("/events", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.Create)
 	v1.Get("/events", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.ListByHost)
 	v1.Post("/events/:id/checkout", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.Checkout)
