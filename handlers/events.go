@@ -232,6 +232,11 @@ func (h *EventHandler) WiPayComplete(c *fiber.Ctx) error {
 	eventID := c.Params("id")
 	state := c.Query("state")
 	if state == "" {
+		// WiPay posts the hosted-checkout return values as form fields, whereas
+		// a browser redirect supplies them in the query string.
+		state = c.FormValue("state")
+	}
+	if state == "" {
 		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
 	}
 
@@ -250,7 +255,11 @@ func (h *EventHandler) WiPayComplete(c *fiber.Ctx) error {
 		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
 	}
 
-	status := strings.ToLower(strings.TrimSpace(c.Query("status")))
+	status := c.Query("status")
+	if status == "" {
+		status = c.FormValue("status")
+	}
+	status = strings.ToLower(strings.TrimSpace(status))
 	if strings.Contains(status, "cancel") || strings.Contains(status, "fail") {
 		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
 	}

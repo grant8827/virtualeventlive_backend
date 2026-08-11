@@ -71,6 +71,9 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	v1.Get("/events", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.ListByHost)
 	v1.Post("/events/:id/checkout", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.Checkout)
 	v1.Get("/events/:id/wipay/complete", eventH.WiPayComplete)
+	// WiPay returns hosted-checkout results as a form POST. Keep GET as well
+	// for browser redirects and manually opened return links.
+	v1.Post("/events/:id/wipay/complete", eventH.WiPayComplete)
 	v1.Patch("/events/:id/ticket", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.TicketSetup)
 	v1.Post("/events/:id/bypass-activate", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.BypassActivate)
 	v1.Delete("/events/:id", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.Delete)
