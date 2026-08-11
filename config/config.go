@@ -28,7 +28,9 @@ type Config struct {
 	// unset until then, so payouts stay queued as "pending" rather than firing blind.
 	WipayAccountNumber string
 	WipayCheckoutURL   string
+	WipayCountryCode   string
 	WipayCurrency      string
+	WipayFeeStructure  string
 	WipayAPIBaseURL    string
 	WipayAPIKey        string
 	WipayEnvironment   string
@@ -60,7 +62,9 @@ func Load() *Config {
 
 		WipayAccountNumber: getEnv("WIPAY_ACCOUNT_NUMBER", ""),
 		WipayCheckoutURL:   getEnv("WIPAY_CHECKOUT_URL", ""),
+		WipayCountryCode:   getEnv("WIPAY_COUNTRY_CODE", "JM"),
 		WipayCurrency:      getEnv("WIPAY_CURRENCY", "USD"),
+		WipayFeeStructure:  getEnv("WIPAY_FEE_STRUCTURE", "merchant_absorb"),
 		WipayAPIBaseURL:    getEnv("WIPAY_API_BASE_URL", ""),
 		WipayAPIKey:        getEnv("WIPAY_API_KEY", ""),
 		WipayEnvironment:   getEnv("WIPAY_ENVIRONMENT", "sandbox"),

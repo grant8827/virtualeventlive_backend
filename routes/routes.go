@@ -58,7 +58,9 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 		WiPay: &services.WiPayService{
 			AccountNumber: cfg.WipayAccountNumber,
 			CheckoutURL:   cfg.WipayCheckoutURL,
+			CountryCode:   cfg.WipayCountryCode,
 			Currency:      cfg.WipayCurrency,
+			FeeStructure:  cfg.WipayFeeStructure,
 			APIBaseURL:    cfg.WipayAPIBaseURL,
 			APIKey:        cfg.WipayAPIKey,
 			Environment:   cfg.WipayEnvironment,

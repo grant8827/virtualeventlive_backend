@@ -18,7 +18,9 @@ import (
 type WiPayService struct {
 	AccountNumber string
 	CheckoutURL   string
+	CountryCode   string
 	Currency      string
+	FeeStructure  string
 	APIBaseURL    string
 	APIKey        string
 	Environment   string // "sandbox" or "live"
@@ -55,6 +57,14 @@ func (w *WiPayService) BuildHostedCheckout(req HostedCheckoutRequest) (*HostedCh
 	if currency == "" {
 		currency = "USD"
 	}
+	countryCode := w.CountryCode
+	if countryCode == "" {
+		countryCode = "JM"
+	}
+	feeStructure := w.FeeStructure
+	if feeStructure == "" {
+		feeStructure = "merchant_absorb"
+	}
 
 	return &HostedCheckout{
 		Method: http.MethodPost,
@@ -62,12 +72,15 @@ func (w *WiPayService) BuildHostedCheckout(req HostedCheckoutRequest) (*HostedCh
 		Fields: map[string]string{
 			"account_number": w.AccountNumber,
 			"api_key":        w.APIKey,
-			"amount":         strconv.FormatFloat(req.Amount, 'f', 2, 64),
+			"country_code":   countryCode,
 			"currency":       currency,
-			"description":    req.Description,
-			"reference":      req.Reference,
-			"success_url":    req.SuccessURL,
-			"cancel_url":     req.CancelURL,
+			"environment":    w.Environment,
+			"fee_structure":  feeStructure,
+			"method":         "credit_card",
+			"order_id":       req.Reference,
+			"origin":         "VirtualEventLive",
+			"response_url":   req.SuccessURL,
+			"total":          strconv.FormatFloat(req.Amount, 'f', 2, 64),
 		},
 	}, nil
 }

@@ -220,9 +220,11 @@ func (h *EventHandler) WiPayLaunch(c *fiber.Ctx) error {
 	checkout, err := h.WiPay.BuildHostedCheckout(services.HostedCheckoutRequest{
 		Amount:      venueFee,
 		Description: "VirtualEventLive venue fee - " + title,
-		Reference:   "venue_fee:" + eventID,
-		SuccessURL:  successURL,
-		CancelURL:   cancelURL,
+		// WiPay order IDs only allow alphanumeric characters, hyphens, and
+		// underscores. Event UUIDs satisfy that constraint with this prefix.
+		Reference:  "venue-fee-" + eventID,
+		SuccessURL: successURL,
+		CancelURL:  cancelURL,
 	})
 	if err != nil {
 		return c.Status(fiber.StatusBadGateway).SendString(err.Error())
