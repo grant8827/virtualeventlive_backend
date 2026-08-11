@@ -469,7 +469,7 @@ func (h *EventHandler) ListByHost(c *fiber.Ctx) error {
 	rows, err := h.DB.Query(context.Background(),
 		`SELECT e.id, e.title, e.event_type, e.start_time, e.ends_at, e.ticket_name,
 		        e.ticket_price, e.ticket_type, e.max_tickets,
-		        e.card_bg_from, e.card_bg_to, e.card_bg_image, e.venue_address,
+		        e.card_bg_from, e.card_bg_to, e.card_bg_image, e.logo_image, e.venue_address,
 		        e.venue_fee, e.venue_paid, e.is_active, (e.ends_at < NOW()) AS expired,
 		        e.created_at, COUNT(t.id) AS ticket_count
 		 FROM events e
@@ -497,6 +497,7 @@ func (h *EventHandler) ListByHost(c *fiber.Ctx) error {
 		CardBgFrom   string     `json:"card_bg_from"`
 		CardBgTo     string     `json:"card_bg_to"`
 		CardBgImage  *string    `json:"card_bg_image"`
+		LogoImage    *string    `json:"logo_image"`
 		VenueAddress *string    `json:"venue_address"`
 		VenueFee     float64    `json:"venue_fee"`
 		VenuePaid    bool       `json:"venue_paid"`
@@ -512,7 +513,7 @@ func (h *EventHandler) ListByHost(c *fiber.Ctx) error {
 		if err := rows.Scan(
 			&e.ID, &e.Title, &e.EventType, &e.StartsAt, &e.EndsAt, &e.TicketName,
 			&e.TicketPrice, &e.TicketType, &e.MaxTickets,
-			&e.CardBgFrom, &e.CardBgTo, &e.CardBgImage, &e.VenueAddress,
+			&e.CardBgFrom, &e.CardBgTo, &e.CardBgImage, &e.LogoImage, &e.VenueAddress,
 			&e.VenueFee, &e.VenuePaid, &e.IsActive, &e.Expired,
 			&e.CreatedAt, &e.TicketCount,
 		); err != nil {

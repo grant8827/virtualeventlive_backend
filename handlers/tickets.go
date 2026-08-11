@@ -30,7 +30,7 @@ func (h *TicketHandler) ListMine(c *fiber.Ctx) error {
 		`SELECT t.id, t.access_token, t.serial_no, t.purchased_at,
 		        t.checked_in_at, t.checked_in_channel,
 		        e.id AS event_id, e.title, e.start_time, e.ticket_type, e.ticket_price,
-		        e.card_bg_from, e.card_bg_to, e.card_bg_image, e.venue_address
+		        e.card_bg_from, e.card_bg_to, e.card_bg_image, e.logo_image, e.venue_address
 		 FROM tickets t
 		 JOIN events e ON e.id = t.event_id
 		 WHERE t.buyer_id = $1
@@ -48,7 +48,7 @@ func (h *TicketHandler) ListMine(c *fiber.Ctx) error {
 		if err := rows.Scan(&t.ID, &t.AccessToken, &t.SerialNo, &t.PurchasedAt,
 			&t.CheckedInAt, &t.CheckedInChannel,
 			&t.EventID, &t.EventTitle, &t.EventStartsAt, &t.TicketType, &t.TicketPrice,
-			&t.CardBgFrom, &t.CardBgTo, &t.CardBgImage, &t.VenueAddress); err != nil {
+			&t.CardBgFrom, &t.CardBgTo, &t.CardBgImage, &t.LogoImage, &t.VenueAddress); err != nil {
 			continue
 		}
 		tickets = append(tickets, t)
@@ -75,6 +75,7 @@ type ticketRow struct {
 	CardBgFrom       string     `json:"card_bg_from"`
 	CardBgTo         string     `json:"card_bg_to"`
 	CardBgImage      *string    `json:"card_bg_image"`
+	LogoImage        *string    `json:"logo_image"`
 	VenueAddress     *string    `json:"venue_address"`
 	EventIsActive    bool       `json:"event_is_active"`
 	EventExpired     bool       `json:"event_expired"`
@@ -92,7 +93,7 @@ func (h *TicketHandler) Lookup(c *fiber.Ctx) error {
 		`SELECT t.id, t.access_token, t.serial_no, t.purchased_at,
 		        t.checked_in_at, t.checked_in_channel,
 		        e.id AS event_id, e.title, e.start_time, e.ticket_type, e.ticket_price,
-		        e.card_bg_from, e.card_bg_to, e.card_bg_image, e.venue_address,
+		        e.card_bg_from, e.card_bg_to, e.card_bg_image, e.logo_image, e.venue_address,
 		        e.is_active, e.ends_at
 		 FROM tickets t
 		 JOIN events e ON e.id = t.event_id
@@ -113,7 +114,7 @@ func (h *TicketHandler) Lookup(c *fiber.Ctx) error {
 		if err := rows.Scan(&t.ID, &t.AccessToken, &t.SerialNo, &t.PurchasedAt,
 			&t.CheckedInAt, &t.CheckedInChannel,
 			&t.EventID, &t.EventTitle, &t.EventStartsAt, &t.TicketType, &t.TicketPrice,
-			&t.CardBgFrom, &t.CardBgTo, &t.CardBgImage, &t.VenueAddress,
+			&t.CardBgFrom, &t.CardBgTo, &t.CardBgImage, &t.LogoImage, &t.VenueAddress,
 			&t.EventIsActive, &endsAt); err != nil {
 			continue
 		}

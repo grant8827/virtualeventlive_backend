@@ -37,7 +37,7 @@ func eventImagePath(eventID, kind string) string {
 }
 
 func validImageKind(kind string) bool {
-	return kind == "ticket" || kind == "flyer"
+	return kind == "ticket" || kind == "flyer" || kind == "logo"
 }
 
 func (h *ImageHandler) Upload(c *fiber.Ctx) error {
@@ -51,7 +51,7 @@ func (h *ImageHandler) Upload(c *fiber.Ctx) error {
 	}
 	eventID, kind := c.Params("id"), c.Params("kind")
 	if !validImageKind(kind) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "image kind must be ticket or flyer"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "image kind must be ticket, flyer, or logo"})
 	}
 
 	var owned bool
@@ -94,14 +94,22 @@ func (h *ImageHandler) Upload(c *fiber.Ctx) error {
 	}
 
 	path := eventImagePath(eventID, kind)
-	if kind == "ticket" {
+	switch kind {
+	case "ticket":
 		if _, err := h.DB.Exec(context.Background(),
 			`UPDATE events SET card_bg_image = $1 WHERE id = $2 AND host_id = $3`,
 			path, eventID, hostID,
 		); err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "image uploaded but could not be saved"})
 		}
-	} else {
+	case "logo":
+		if _, err := h.DB.Exec(context.Background(),
+			`UPDATE events SET logo_image = $1 WHERE id = $2 AND host_id = $3`,
+			path, eventID, hostID,
+		); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "image uploaded but could not be saved"})
+		}
+	default: // flyer
 		_, _ = h.DB.Exec(context.Background(),
 			`UPDATE advertisements SET image_url = $1 WHERE event_id = $2 AND host_id = $3`,
 			path, eventID, hostID,
@@ -132,7 +140,7 @@ func (h *ImageHandler) Delete(c *fiber.Ctx) error {
 	}
 	eventID, kind := c.Params("id"), c.Params("kind")
 	if !validImageKind(kind) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "image kind must be ticket or flyer"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "image kind must be ticket, flyer, or logo"})
 	}
 
 	var owned bool
@@ -146,9 +154,12 @@ func (h *ImageHandler) Delete(c *fiber.Ctx) error {
 	if err := h.Storage.Delete(context.Background(), eventImageKey(eventID, kind)); err != nil {
 		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": err.Error()})
 	}
-	if kind == "ticket" {
+	switch kind {
+	case "ticket":
 		_, _ = h.DB.Exec(context.Background(), `UPDATE events SET card_bg_image = '' WHERE id = $1 AND host_id = $2`, eventID, hostID)
-	} else {
+	case "logo":
+		_, _ = h.DB.Exec(context.Background(), `UPDATE events SET logo_image = '' WHERE id = $1 AND host_id = $2`, eventID, hostID)
+	default: // flyer
 		_, _ = h.DB.Exec(context.Background(), `UPDATE advertisements SET image_url = '' WHERE event_id = $1 AND host_id = $2`, eventID, hostID)
 	}
 	return c.JSON(fiber.Map{"ok": true})
