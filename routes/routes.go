@@ -65,6 +65,7 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 			APIKey:        cfg.WipayAPIKey,
 			Environment:   cfg.WipayEnvironment,
 		},
+		PayPal: &services.PayPalService{ClientID: cfg.PaypalClientID, ClientSecret: cfg.PaypalClientSecret, Environment: cfg.PaypalEnvironment},
 	}
 	v1.Get("/events/public", eventH.ListPublic)
 	v1.Get("/events/:id", eventH.GetByID)
@@ -79,6 +80,7 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	// WiPay returns hosted-checkout results as a form POST. Keep GET as well
 	// for browser redirects and manually opened return links.
 	v1.Post("/events/:id/wipay/complete", eventH.WiPayComplete)
+	v1.Get("/events/:id/paypal/complete", eventH.PayPalComplete)
 	v1.Patch("/events/:id/ticket", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.TicketSetup)
 	v1.Post("/events/:id/bypass-activate", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.BypassActivate)
 	v1.Delete("/events/:id", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), eventH.Delete)

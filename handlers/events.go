@@ -2,14 +2,17 @@ package handlers
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"math"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	stripe "github.com/stripe/stripe-go/v82"
 	"github.com/stripe/stripe-go/v82/checkout/session"
@@ -19,10 +22,11 @@ import (
 )
 
 type EventHandler struct {
-	DB    *pgxpool.Pool
-	Cfg   *config.Config
-	IVS   *services.IVSService
-	WiPay *services.WiPayService
+	DB     *pgxpool.Pool
+	Cfg    *config.Config
+	IVS    *services.IVSService
+	WiPay  *services.WiPayService
+	PayPal *services.PayPalService
 }
 
 // nullIfEmpty maps "" to a real SQL NULL instead of storing an empty string,
@@ -138,6 +142,28 @@ func (h *EventHandler) Checkout(c *fiber.Ctx) error {
 			"checkout_provider": "wipay",
 			"checkout_url":      launchURL,
 		})
+	}
+	if provider == "paypal" {
+		if h.PayPal == nil || !h.PayPal.Enabled() {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "paypal checkout not configured"})
+		}
+		state, err := h.signVenueFeeState(eventID, hostID, venueFee)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to prepare PayPal checkout"})
+		}
+		returnURL := fmt.Sprintf("%s/api/v1/events/%s/paypal/complete?state=%s",
+			strings.TrimRight(c.BaseURL(), "/"), url.PathEscape(eventID), url.QueryEscape(state))
+		order, err := h.PayPal.CreateCheckoutOrder(services.CheckoutOrderRequest{
+			Amount:      venueFee,
+			Description: "VirtualEventLive venue fee - " + title,
+			Reference:   "venue-fee-" + eventID,
+			ReturnURL:   returnURL,
+			CancelURL:   h.Cfg.FrontendURL + "/dashboard?venue_paid=0",
+		})
+		if err != nil {
+			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "failed to create PayPal checkout"})
+		}
+		return c.JSON(fiber.Map{"checkout_provider": "paypal", "checkout_url": order.ApprovalURL})
 	}
 
 	// No payment provider configured — bypass payment and mark event as paid directly
@@ -276,38 +302,68 @@ func (h *EventHandler) WiPayComplete(c *fiber.Ctx) error {
 	return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=1")
 }
 
+func (h *EventHandler) PayPalComplete(c *fiber.Ctx) error {
+	eventID := c.Params("id")
+	state := c.Query("state")
+	orderID := c.Query("token")
+	if state == "" || orderID == "" {
+		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
+	}
+
+	var hostID string
+	var venueFee float64
+	if err := h.DB.QueryRow(context.Background(), `SELECT host_id, venue_fee FROM events WHERE id = $1`, eventID).Scan(&hostID, &venueFee); err != nil {
+		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
+	}
+	if err := h.verifyVenueFeeState(state, eventID, hostID, venueFee); err != nil {
+		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
+	}
+	if h.PayPal == nil || h.PayPal.CaptureCheckoutOrder(orderID) != nil {
+		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
+	}
+	if err := activateVenuePaidEvent(context.Background(), h.DB, h.IVS, eventID); err != nil {
+		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
+	}
+	return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=1")
+}
+
 func (h *EventHandler) signVenueFeeState(eventID, hostID string, venueFee float64) (string, error) {
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"event_id":     eventID,
-		"host_id":      hostID,
-		"amount_cents": int64(math.Round(venueFee * 100)),
-		"exp":          time.Now().Add(30 * time.Minute).Unix(),
-	})
-	return token.SignedString([]byte(h.Cfg.JWTSecret))
+	// WiPay limits response_url to 255 characters. The event ID is already in
+	// the route, so a compact expiry plus HMAC can bind the state to the event,
+	// host, and amount without embedding a much longer JWT in the URL.
+	expiresAt := time.Now().Add(30 * time.Minute).Unix()
+	payload := venueFeeStatePayload(eventID, hostID, venueFee, expiresAt)
+	mac := hmac.New(sha256.New, []byte(h.Cfg.JWTSecret))
+	_, _ = mac.Write([]byte(payload))
+	signature := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return strconv.FormatInt(expiresAt, 10) + "." + signature, nil
 }
 
 func (h *EventHandler) verifyVenueFeeState(tokenString, eventID, hostID string, venueFee float64) error {
-	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (any, error) {
-		return []byte(h.Cfg.JWTSecret), nil
-	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
-	if err != nil || !token.Valid {
+	parts := strings.Split(tokenString, ".")
+	if len(parts) != 2 {
 		return fmt.Errorf("invalid state token")
 	}
-
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		return fmt.Errorf("invalid state claims")
-	}
-	if claims["event_id"] != eventID || claims["host_id"] != hostID {
-		return fmt.Errorf("state mismatch")
+	expiresAt, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || time.Now().Unix() > expiresAt {
+		return fmt.Errorf("expired or invalid state token")
 	}
 
-	amountCents, ok := claims["amount_cents"].(float64)
-	if !ok || int64(amountCents) != int64(math.Round(venueFee*100)) {
-		return fmt.Errorf("amount mismatch")
+	provided, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return fmt.Errorf("invalid state signature")
+	}
+	mac := hmac.New(sha256.New, []byte(h.Cfg.JWTSecret))
+	_, _ = mac.Write([]byte(venueFeeStatePayload(eventID, hostID, venueFee, expiresAt)))
+	if !hmac.Equal(provided, mac.Sum(nil)) {
+		return fmt.Errorf("state signature mismatch")
 	}
 
 	return nil
+}
+
+func venueFeeStatePayload(eventID, hostID string, venueFee float64, expiresAt int64) string {
+	return eventID + ":" + hostID + ":" + strconv.FormatInt(int64(math.Round(venueFee*100)), 10) + ":" + strconv.FormatInt(expiresAt, 10)
 }
 
 func renderHostedCheckoutHTML(checkout *services.HostedCheckout) string {
