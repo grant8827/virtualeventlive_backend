@@ -202,10 +202,19 @@ func (h *StripeHandler) handleTicketPurchase(sess *stripe.CheckoutSession) error
 	}
 
 	split := services.CalculateSplit(ticketPrice)
+	// Stripe-connected hosts are paid via a destination charge: Stripe
+	// transfers gross-minus-platform-fee directly to them and absorbs its own
+	// processing fee from the platform's kept application fee. WiPay/PayPal
+	// hosts are paid manually out of the platform's balance, so that payout
+	// nets out an estimated processing-fee reserve instead.
+	hostPayout := split.HostPayout
+	if payoutGateway == "stripe" {
+		hostPayout = split.StripeDestinationPayout()
+	}
 	if _, err := h.DB.Exec(context.Background(),
 		`INSERT INTO ledger_entries (ticket_id, event_id, gross_amount, stripe_fee, platform_fee, host_payout, payout_gateway, payout_status)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-		ticketID, eventID, split.GrossAmount, split.StripeFee, split.PlatformFee, split.HostPayout, payoutGateway, payoutStatus,
+		ticketID, eventID, split.GrossAmount, split.StripeFee, split.PlatformFee, hostPayout, payoutGateway, payoutStatus,
 	); err != nil {
 		return fmt.Errorf("insert ledger: %w", err)
 	}
