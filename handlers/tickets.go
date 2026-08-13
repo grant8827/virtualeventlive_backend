@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -389,7 +391,7 @@ func (h *TicketHandler) GuestPurchase(c *fiber.Ctx) error {
 
 	s, err := session.New(params)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to create checkout session"})
+		return stripeCheckoutError(c, err)
 	}
 
 	return c.JSON(fiber.Map{"checkout_url": s.URL})
@@ -477,8 +479,23 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 
 	s, err := session.New(params)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to create checkout session"})
+		return stripeCheckoutError(c, err)
 	}
 
 	return c.JSON(fiber.Map{"checkout_url": s.URL})
+}
+
+// stripeCheckoutError preserves Stripe's actionable, non-sensitive error
+// message. The previous generic 500 made deployment/configuration failures
+// impossible to diagnose from the checkout screen or Railway logs.
+func stripeCheckoutError(c *fiber.Ctx, err error) error {
+	var stripeErr *stripe.Error
+	if errors.As(err, &stripeErr) {
+		fmt.Printf("stripe checkout error: request_id=%s code=%s param=%s message=%s\n", stripeErr.RequestID, stripeErr.Code, stripeErr.Param, stripeErr.Msg)
+		if stripeErr.Msg != "" {
+			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "Stripe checkout error: " + stripeErr.Msg})
+		}
+	}
+	fmt.Printf("stripe checkout error: %v\n", err)
+	return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "Stripe could not create checkout. Check the backend logs."})
 }
