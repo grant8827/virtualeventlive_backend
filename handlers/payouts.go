@@ -220,7 +220,7 @@ func (h *PayoutHandler) Payout(c *fiber.Ctx) error {
 		if paypalAccountID == nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "no PayPal account connected"})
 		}
-		ref, err := h.PayPal.SendPayout(*paypalAccountID, pending, "VirtualEventLive ticket revenue")
+		ref, err := h.PayPal.SendPayout(*paypalAccountID, pending, "Virtual Event Plus ticket revenue")
 		if err != nil {
 			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": err.Error()})
 		}

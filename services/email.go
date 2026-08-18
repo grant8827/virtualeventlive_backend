@@ -29,7 +29,7 @@ func (e *EmailService) SendTicketConfirmation(toEmail, eventTitle, accessToken s
 <body style="font-family:sans-serif;background:#0a0a0a;color:#fff;padding:40px 20px;margin:0">
   <div style="max-width:520px;margin:0 auto">
     <h1 style="font-size:22px;margin-bottom:4px">Your ticket is confirmed</h1>
-    <p style="color:#71717a;font-size:14px;margin-top:0">VirtualEventLive</p>
+    <p style="color:#71717a;font-size:14px;margin-top:0">Virtual Event Plus</p>
 
     <div style="background:#18181b;border:1px solid #27272a;border-radius:12px;padding:24px;margin:28px 0">
       <p style="font-size:18px;font-weight:600;margin:0 0 6px">%s</p>
@@ -60,7 +60,7 @@ func (e *EmailService) SendTicketConfirmation(toEmail, eventTitle, accessToken s
 	)
 
 	body := map[string]interface{}{
-		"from":    "VirtualEventLive <" + e.FromEmail + ">",
+		"from":    "Virtual Event Plus <" + e.FromEmail + ">",
 		"to":      []string{toEmail},
 		"subject": "Your ticket for " + eventTitle,
 		"html":    html,

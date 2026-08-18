@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -54,7 +55,7 @@ func (h *StripeHandler) ConnectOnboard(c *fiber.Ctx) error {
 			},
 		})
 		if err != nil {
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to create Stripe account"})
+			return stripeConnectError(c, "create account", err)
 		}
 
 		stripeAccountID = acc.ID
@@ -76,11 +77,23 @@ func (h *StripeHandler) ConnectOnboard(c *fiber.Ctx) error {
 		Type:       stripe.String("account_onboarding"),
 	})
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to create onboarding link"})
+		return stripeConnectError(c, "create onboarding link", err)
 	}
 
 	auditPayoutEvent(h.DB, c, hostID, "stripe_onboarding_started")
 	return c.JSON(fiber.Map{"url": link.URL})
+}
+
+func stripeConnectError(c *fiber.Ctx, operation string, err error) error {
+	var stripeErr *stripe.Error
+	if errors.As(err, &stripeErr) {
+		fmt.Printf("stripe connect %s error: request_id=%s code=%s param=%s message=%s\n", operation, stripeErr.RequestID, stripeErr.Code, stripeErr.Param, stripeErr.Msg)
+		if stripeErr.Msg != "" {
+			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "Stripe Connect error: " + stripeErr.Msg})
+		}
+	}
+	fmt.Printf("stripe connect %s error: %v\n", operation, err)
+	return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "Stripe Connect could not " + operation + ". Check backend logs."})
 }
 
 func (h *StripeHandler) Webhook(c *fiber.Ctx) error {

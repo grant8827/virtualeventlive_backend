@@ -78,7 +78,7 @@ func (w *WiPayService) BuildHostedCheckout(req HostedCheckoutRequest) (*HostedCh
 			"fee_structure":  feeStructure,
 			"method":         "credit_card",
 			"order_id":       req.Reference,
-			"origin":         "VirtualEventLive",
+			"origin":         "Virtual Event Plus",
 			"response_url":   req.SuccessURL,
 			"total":          strconv.FormatFloat(req.Amount, 'f', 2, 64),
 		},

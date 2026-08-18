@@ -95,7 +95,7 @@ func (p *PayPalService) CreateCheckoutOrder(order CheckoutOrderRequest) (*Checko
 		"application_context": map[string]string{
 			"return_url":  order.ReturnURL,
 			"cancel_url":  order.CancelURL,
-			"brand_name":  "VirtualEventLive",
+			"brand_name":  "Virtual Event Plus",
 			"user_action": "PAY_NOW",
 		},
 	}
@@ -188,7 +188,7 @@ func (p *PayPalService) SendPayout(receiverEmail string, amountUSD float64, note
 	body := map[string]any{
 		"sender_batch_header": map[string]any{
 			"sender_batch_id": fmt.Sprintf("vel-%d", time.Now().UnixNano()),
-			"email_subject":   "You have a payout from VirtualEventLive",
+			"email_subject":   "You have a payout from Virtual Event Plus",
 		},
 		"items": []map[string]any{
 			{

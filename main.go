@@ -37,7 +37,7 @@ func main() {
 	defer rdb.Close()
 
 	app := fiber.New(fiber.Config{
-		AppName:      "VirtualEventLive API v1",
+		AppName:      "Virtual Event Plus API v1",
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		BodyLimit:    9 << 20,

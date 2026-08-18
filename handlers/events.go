@@ -155,7 +155,7 @@ func (h *EventHandler) Checkout(c *fiber.Ctx) error {
 			strings.TrimRight(c.BaseURL(), "/"), url.PathEscape(eventID), url.QueryEscape(state))
 		order, err := h.PayPal.CreateCheckoutOrder(services.CheckoutOrderRequest{
 			Amount:      venueFee,
-			Description: "VirtualEventLive venue fee - " + title,
+			Description: "Virtual Event Plus venue fee - " + title,
 			Reference:   "venue-fee-" + eventID,
 			ReturnURL:   returnURL,
 			CancelURL:   h.Cfg.FrontendURL + "/dashboard?venue_paid=0",
@@ -186,7 +186,7 @@ func (h *EventHandler) Checkout(c *fiber.Ctx) error {
 					Currency: stripe.String("usd"),
 					ProductData: &stripe.CheckoutSessionLineItemPriceDataProductDataParams{
 						Name:        stripe.String("Venue rental — " + title),
-						Description: stripe.String("VirtualEventLive streaming venue fee"),
+						Description: stripe.String("Virtual Event Plus streaming venue fee"),
 					},
 					UnitAmount: stripe.Int64(int64(venueFee * 100)),
 				},
@@ -245,7 +245,7 @@ func (h *EventHandler) WiPayLaunch(c *fiber.Ctx) error {
 
 	checkout, err := h.WiPay.BuildHostedCheckout(services.HostedCheckoutRequest{
 		Amount:      venueFee,
-		Description: "VirtualEventLive venue fee - " + title,
+		Description: "Virtual Event Plus venue fee - " + title,
 		// WiPay order IDs only allow alphanumeric characters, hyphens, and
 		// underscores. Event UUIDs satisfy that constraint with this prefix.
 		Reference:  "venue-fee-" + eventID,
