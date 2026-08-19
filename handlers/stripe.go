@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -100,7 +101,7 @@ func (h *StripeHandler) Webhook(c *fiber.Ctx) error {
 	payload := c.Body()
 	sigHeader := c.Get("Stripe-Signature")
 
-	event, err := webhook.ConstructEvent(payload, sigHeader, h.Cfg.StripeWebhookSecret)
+	event, err := constructStripeWebhookEvent(payload, sigHeader, h.Cfg.StripeWebhookSecret)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid webhook signature"})
 	}
@@ -134,6 +135,29 @@ func (h *StripeHandler) Webhook(c *fiber.Ctx) error {
 	}
 
 	return c.Status(fiber.StatusOK).JSON(fiber.Map{"received": true})
+}
+
+// Stripe gives each webhook destination its own signing secret. Test and live
+// destinations can share this public URL but have different secrets, so accept
+// a comma-separated list in STRIPE_WEBHOOK_SECRET rather than forcing one
+// environment to break when the other is configured.
+func constructStripeWebhookEvent(payload []byte, signature, configuredSecrets string) (stripe.Event, error) {
+	var lastErr error
+	for _, secret := range strings.Split(configuredSecrets, ",") {
+		secret = strings.TrimSpace(secret)
+		if secret == "" {
+			continue
+		}
+		event, err := webhook.ConstructEvent(payload, signature, secret)
+		if err == nil {
+			return event, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no Stripe webhook signing secret configured")
+	}
+	return stripe.Event{}, lastErr
 }
 
 func (h *StripeHandler) handleVenueFeePaid(sess *stripe.CheckoutSession) error {
