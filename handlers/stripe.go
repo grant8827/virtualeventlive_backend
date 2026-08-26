@@ -97,12 +97,20 @@ func stripeConnectError(c *fiber.Ctx, operation string, err error) error {
 	return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "Stripe Connect could not " + operation + ". Check backend logs."})
 }
 
+func safePrefix(s string) string {
+	if len(s) <= 12 {
+		return s
+	}
+	return s[:12] + "..."
+}
+
 func (h *StripeHandler) Webhook(c *fiber.Ctx) error {
 	payload := c.Body()
 	sigHeader := c.Get("Stripe-Signature")
 
 	event, err := constructStripeWebhookEvent(payload, sigHeader, h.Cfg.StripeWebhookSecret)
 	if err != nil {
+		fmt.Printf("DEBUG webhook verify failed: err=%v secretLen=%d secretPrefix=%q sig=%q\n", err, len(h.Cfg.StripeWebhookSecret), safePrefix(h.Cfg.StripeWebhookSecret), sigHeader)
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid webhook signature"})
 	}
 
