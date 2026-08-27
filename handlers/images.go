@@ -132,7 +132,15 @@ func (h *ImageHandler) Get(c *fiber.Ctx) error {
 	if err != nil {
 		return c.SendStatus(fiber.StatusNotFound)
 	}
-	defer object.Body.Close()
+	// No defer object.Body.Close() here: SendStream only registers the
+	// reader on the response, it doesn't consume it -- fasthttp reads
+	// (and, since io.ReadCloser satisfies io.Closer, itself closes) the
+	// stream later, during the response-write phase that runs after this
+	// handler has already returned. A defer here closed the S3 body
+	// before fasthttp ever got to read from it, so every response body
+	// came out empty/broken -- invisible in the access log, which records
+	// the 200 this handler set before that write phase ever ran, and
+	// visible to real clients as a proxy-level failure instead.
 
 	if object.ContentType != nil {
 		c.Set(fiber.HeaderContentType, *object.ContentType)
@@ -140,11 +148,8 @@ func (h *ImageHandler) Get(c *fiber.Ctx) error {
 	c.Set(fiber.HeaderCacheControl, "public, max-age=3600")
 
 	// SendStream defaults to an unknown size, which forces
-	// Transfer-Encoding: chunked with no Content-Length. Railway's edge
-	// proxy intermittently (and for some requests, consistently) fails
-	// to relay that shape of response, returning its own 502 fallback
-	// page without ever reaching this instance. S3 already tells us the
-	// exact size, so give it to SendStream and skip chunked entirely.
+	// Transfer-Encoding: chunked with no Content-Length. S3 already tells
+	// us the exact size, so pass it through and skip chunked entirely.
 	if object.ContentLength != nil {
 		return c.SendStream(object.Body, int(*object.ContentLength))
 	}
