@@ -6,10 +6,15 @@ import (
 )
 
 type Config struct {
-	DatabaseURL         string
-	RedisURL            string
-	JWTSecret           string
-	FrontendURL         string
+	DatabaseURL string
+	RedisURL    string
+	JWTSecret   string
+	FrontendURL string
+	// Comma-separated list of origins allowed to call the API cross-origin.
+	// Kept separate from FrontendURL, which is reused elsewhere (Stripe
+	// Connect redirect links, email links) as a single URL and would break
+	// if it became a list.
+	CorsAllowedOrigins  string
 	Port                string
 	VenueFeeProvider    string
 	StripeSecretKey     string
@@ -43,10 +48,12 @@ type Config struct {
 
 func Load() *Config {
 	return &Config{
-		DatabaseURL:         getEnv("DATABASE_URL", ""),
-		RedisURL:            getEnv("REDIS_URL", "redis://localhost:6379"),
-		JWTSecret:           getEnv("JWT_SECRET", "change-me-in-production"),
-		FrontendURL:         getEnv("FRONTEND_URL", "http://localhost:3000"),
+		DatabaseURL: getEnv("DATABASE_URL", ""),
+		RedisURL:    getEnv("REDIS_URL", "redis://localhost:6379"),
+		JWTSecret:   getEnv("JWT_SECRET", "change-me-in-production"),
+		FrontendURL: getEnv("FRONTEND_URL", "http://localhost:3000"),
+		CorsAllowedOrigins: getEnv("CORS_ALLOWED_ORIGINS",
+			"https://virtualeventplus.com,https://www.virtualeventplus.com,https://virtualeventlivefrontend-production.up.railway.app,http://localhost:5173"),
 		Port:                getEnv("PORT", "8080"),
 		VenueFeeProvider:    getEnv("VENUE_FEE_PROVIDER", "auto"),
 		StripeSecretKey:     getEnv("STRIPE_SECRET_KEY", ""),

@@ -46,7 +46,7 @@ func main() {
 	app.Use(recover.New())
 	app.Use(logger.New())
 	app.Use(cors.New(cors.Config{
-		AllowOrigins:     cfg.FrontendURL + ",http://localhost:5173",
+		AllowOrigins:     cfg.CorsAllowedOrigins,
 		AllowMethods:     "GET,POST,PUT,PATCH,DELETE,OPTIONS",
 		AllowHeaders:     "Origin, Content-Type, Accept, Authorization, X-Payout-Token",
 		AllowCredentials: true,
