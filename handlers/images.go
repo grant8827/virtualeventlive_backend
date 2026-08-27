@@ -138,6 +138,16 @@ func (h *ImageHandler) Get(c *fiber.Ctx) error {
 		c.Set(fiber.HeaderContentType, *object.ContentType)
 	}
 	c.Set(fiber.HeaderCacheControl, "public, max-age=3600")
+
+	// SendStream defaults to an unknown size, which forces
+	// Transfer-Encoding: chunked with no Content-Length. Railway's edge
+	// proxy intermittently (and for some requests, consistently) fails
+	// to relay that shape of response, returning its own 502 fallback
+	// page without ever reaching this instance. S3 already tells us the
+	// exact size, so give it to SendStream and skip chunked entirely.
+	if object.ContentLength != nil {
+		return c.SendStream(object.Body, int(*object.ContentLength))
+	}
 	return c.SendStream(object.Body)
 }
 
