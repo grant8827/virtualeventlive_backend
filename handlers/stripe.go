@@ -11,7 +11,6 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
 	stripe "github.com/stripe/stripe-go/v82"
-	"github.com/stripe/stripe-go/v82/account"
 	"github.com/stripe/stripe-go/v82/accountlink"
 	"github.com/stripe/stripe-go/v82/webhook"
 
@@ -48,18 +47,17 @@ func (h *StripeHandler) ConnectOnboard(c *fiber.Ctx) error {
 			`UPDATE connected_accounts SET payout_gateway = 'stripe' WHERE user_id = $1`, hostID,
 		)
 	} else {
-		acc, err := account.New(&stripe.AccountParams{
-			Type: stripe.String(string(stripe.AccountTypeExpress)),
-			Capabilities: &stripe.AccountCapabilitiesParams{
-				CardPayments: &stripe.AccountCapabilitiesCardPaymentsParams{Requested: stripe.Bool(true)},
-				Transfers:    &stripe.AccountCapabilitiesTransfersParams{Requested: stripe.Bool(true)},
-			},
-		})
+		var hostEmail string
+		_ = h.DB.QueryRow(context.Background(),
+			`SELECT email FROM users WHERE id = $1`, hostID,
+		).Scan(&hostEmail)
+
+		acctID, err := services.CreateExpressAccountV2(h.Cfg.StripeSecretKey, hostEmail)
 		if err != nil {
-			return stripeConnectError(c, "create account", err)
+			return stripeConnectErrorMsg(c, "create account", err)
 		}
 
-		stripeAccountID = acc.ID
+		stripeAccountID = acctID
 		_, err = h.DB.Exec(context.Background(),
 			`INSERT INTO connected_accounts (user_id, stripe_account_id, payout_gateway)
 			 VALUES ($1, $2, 'stripe')
@@ -95,6 +93,14 @@ func stripeConnectError(c *fiber.Ctx, operation string, err error) error {
 	}
 	fmt.Printf("stripe connect %s error: %v\n", operation, err)
 	return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "Stripe Connect could not " + operation + ". Check backend logs."})
+}
+
+// stripeConnectErrorMsg mirrors stripeConnectError for calls that hit
+// Stripe's v2 API directly (services.CreateExpressAccountV2) instead of
+// through stripe-go, so the error is a plain error rather than *stripe.Error.
+func stripeConnectErrorMsg(c *fiber.Ctx, operation string, err error) error {
+	fmt.Printf("stripe connect %s error: %v\n", operation, err)
+	return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "Stripe Connect error: " + err.Error()})
 }
 
 func (h *StripeHandler) Webhook(c *fiber.Ctx) error {
