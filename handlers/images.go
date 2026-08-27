@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -125,12 +124,21 @@ func (h *ImageHandler) Get(c *fiber.Ctx) error {
 		return c.SendStatus(fiber.StatusNotFound)
 	}
 
-	url, err := h.Storage.PresignGet(context.Background(), eventImageKey(eventID, kind), 15*time.Minute)
+	// Stream the object through the API instead of redirecting to a presigned
+	// S3 URL. Ticket export loads these images into a canvas; a redirect makes
+	// the final response subject to the bucket's CORS policy and prevents both
+	// Download and Print when that policy is absent or misconfigured.
+	object, err := h.Storage.Get(context.Background(), eventImageKey(eventID, kind))
 	if err != nil {
 		return c.SendStatus(fiber.StatusNotFound)
 	}
-	c.Set(fiber.HeaderCacheControl, "private, max-age=300")
-	return c.Redirect(url, fiber.StatusTemporaryRedirect)
+	defer object.Body.Close()
+
+	if object.ContentType != nil {
+		c.Set(fiber.HeaderContentType, *object.ContentType)
+	}
+	c.Set(fiber.HeaderCacheControl, "public, max-age=3600")
+	return c.SendStream(object.Body)
 }
 
 func (h *ImageHandler) Delete(c *fiber.Ctx) error {
