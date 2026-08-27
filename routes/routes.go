@@ -49,6 +49,8 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	v1.Post("/auth/login", authH.Login)
 	v1.Post("/auth/logout", authH.Logout)
 	v1.Get("/auth/me", middleware.Protected(cfg.JWTSecret), authH.Me)
+	v1.Put("/auth/profile", middleware.Protected(cfg.JWTSecret), authH.UpdateProfile)
+	v1.Post("/auth/change-password", middleware.Protected(cfg.JWTSecret), authH.ChangePassword)
 
 	// Events
 	eventH := &handlers.EventHandler{
