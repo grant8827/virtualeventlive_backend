@@ -44,6 +44,16 @@ func CreateExpressAccountV2(secretKey, contactEmail string) (accountID string, e
 	}
 	body := map[string]any{
 		"dashboard": "express",
+		// v2 requires identity.country before it will accept a merchant
+		// configuration -- v1 didn't need this because it silently defaulted
+		// an omitted Country to the platform's own account country. Matching
+		// that default explicitly (this platform's Stripe account is
+		// US-registered) rather than asking the host up front keeps this a
+		// like-for-like migration; a real per-host country selector, if
+		// wanted, is a separate feature, not a v1->v2 compatibility fix.
+		"identity": map[string]any{
+			"country": "US",
+		},
 		"configuration": map[string]any{
 			"merchant": map[string]any{
 				"capabilities": map[string]any{
@@ -73,12 +83,13 @@ func CreateExpressAccountV2(secretKey, contactEmail string) (accountID string, e
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+secretKey)
-	// No Stripe-Version header: the account's current default version
-	// supports this endpoint, and the only field this reads back is `id`,
-	// which is stable across versions -- no reason to pin one that would
-	// just need updating again later, the way the webhook signing secret
-	// did (see the ConstructEvent API-version mismatch this same handler
-	// hit earlier).
+	// Unlike v1, the v2 API has no silent default -- omitting this header
+	// fails every request with "You did not provide an API version."
+	// Pinned to the version this account's own events were observed
+	// carrying (see the ConstructEvent API-version mismatch this same
+	// handler hit earlier): confirmed compatible, and only the stable `id`
+	// field is read back here regardless.
+	req.Header.Set("Stripe-Version", "2026-07-29.dahlia")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
