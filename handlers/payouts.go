@@ -38,7 +38,7 @@ func (h *PayoutHandler) Status(c *fiber.Ctx) error {
 		stripeAccountID *string
 		wipayAccountID  *string
 		paypalAccountID *string
-		payoutGateway   string
+		payoutGateway   *string
 		stripePayoutOK  bool
 	)
 	err := h.DB.QueryRow(context.Background(),
@@ -54,7 +54,11 @@ func (h *PayoutHandler) Status(c *fiber.Ctx) error {
 		})
 	}
 
-	stripe := gatewayStatus{PayoutEnabled: payoutGateway == "stripe" && stripePayoutOK}
+	activeGateway := ""
+	if payoutGateway != nil {
+		activeGateway = *payoutGateway
+	}
+	stripe := gatewayStatus{PayoutEnabled: activeGateway == "stripe" && stripePayoutOK}
 	if stripeAccountID != nil {
 		stripe.Connected = true
 		stripe.AccountID = *stripeAccountID
@@ -69,7 +73,7 @@ func (h *PayoutHandler) Status(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{
-		"active_gateway": payoutGateway,
+		"active_gateway": activeGateway,
 		"stripe":         stripe,
 		"wipay":          wipay,
 		"paypal":         paypal,
@@ -78,6 +82,60 @@ func (h *PayoutHandler) Status(c *fiber.Ctx) error {
 
 type connectAccountRequest struct {
 	AccountID string `json:"account_id"`
+}
+
+type activateGatewayRequest struct {
+	Gateway string `json:"gateway"`
+}
+
+// Activate switches to an account that the host has already connected. Stripe
+// can only be selected after Stripe reports that payouts are enabled.
+func (h *PayoutHandler) Activate(c *fiber.Ctx) error {
+	hostID, ok := c.Locals("user_id").(string)
+	if !ok || hostID == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+
+	var req activateGatewayRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	}
+	req.Gateway = strings.ToLower(strings.TrimSpace(req.Gateway))
+	if req.Gateway != "stripe" && req.Gateway != "wipay" && req.Gateway != "paypal" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "gateway must be stripe, wipay, or paypal"})
+	}
+
+	result, err := h.DB.Exec(context.Background(),
+		`UPDATE connected_accounts SET payout_gateway = $1
+		 WHERE user_id = $2 AND CASE $1
+		   WHEN 'stripe' THEN stripe_account_id IS NOT NULL AND payout_enabled = true
+		   WHEN 'wipay' THEN wipay_account_id IS NOT NULL
+		   WHEN 'paypal' THEN paypal_account_id IS NOT NULL
+		   ELSE false END`, req.Gateway, hostID,
+	)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to activate payout account"})
+	}
+	if result.RowsAffected() == 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "that payout account is not connected or ready"})
+	}
+	auditPayoutEvent(h.DB, c, hostID, "payout_gateway_activated_"+req.Gateway)
+	return c.JSON(fiber.Map{"active_gateway": req.Gateway})
+}
+
+// Deactivate pauses new ticket sales without deleting any connected account.
+func (h *PayoutHandler) Deactivate(c *fiber.Ctx) error {
+	hostID, ok := c.Locals("user_id").(string)
+	if !ok || hostID == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+	if _, err := h.DB.Exec(context.Background(),
+		`UPDATE connected_accounts SET payout_gateway = NULL WHERE user_id = $1`, hostID,
+	); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to deactivate payout accounts"})
+	}
+	auditPayoutEvent(h.DB, c, hostID, "payout_gateway_deactivated")
+	return c.JSON(fiber.Map{"active_gateway": ""})
 }
 
 // ConnectWiPay saves the host's WiPay account number and makes WiPay the

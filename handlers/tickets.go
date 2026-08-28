@@ -341,7 +341,8 @@ func (h *TicketHandler) GuestPurchase(c *fiber.Ctx) error {
 	err = h.DB.QueryRow(context.Background(),
 		`SELECT ca.stripe_account_id, ca.payout_gateway FROM connected_accounts ca
 		 JOIN events e ON e.host_id = ca.user_id
-		 WHERE e.id = $1`,
+		 WHERE e.id = $1 AND ca.payout_gateway IS NOT NULL
+		   AND (ca.payout_gateway <> 'stripe' OR ca.payout_enabled = true)`,
 		req.EventID,
 	).Scan(&stripeAccountID, &payoutGateway)
 	if err != nil {
@@ -431,7 +432,9 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 		 FROM events e
 		 JOIN connected_accounts ca ON ca.user_id = e.host_id
 		 JOIN users u ON u.id = $2
-		 WHERE e.id = $1 AND e.is_active = true AND e.venue_paid = true AND e.ends_at > NOW()`,
+		 WHERE e.id = $1 AND e.is_active = true AND e.venue_paid = true AND e.ends_at > NOW()
+		   AND ca.payout_gateway IS NOT NULL
+		   AND (ca.payout_gateway <> 'stripe' OR ca.payout_enabled = true)`,
 		req.EventID, buyerID,
 	).Scan(&eventTitle, &ticketPrice, &stripeAccountID, &payoutGateway, &buyerEmail)
 	if err != nil {

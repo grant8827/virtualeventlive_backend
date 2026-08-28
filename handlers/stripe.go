@@ -41,11 +41,6 @@ func (h *StripeHandler) ConnectOnboard(c *fiber.Ctx) error {
 	var stripeAccountID string
 	if existingAccountID != "" {
 		stripeAccountID = existingAccountID
-		// Re-activate Stripe as the payout gateway in case the host had
-		// switched to WiPay/PayPal since first onboarding here.
-		_, _ = h.DB.Exec(context.Background(),
-			`UPDATE connected_accounts SET payout_gateway = 'stripe' WHERE user_id = $1`, hostID,
-		)
 	} else {
 		var hostEmail string
 		_ = h.DB.QueryRow(context.Background(),
