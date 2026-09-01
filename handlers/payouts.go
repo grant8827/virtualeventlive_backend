@@ -2,9 +2,12 @@ package handlers
 
 import (
 	"context"
+	"fmt"
+	"net/url"
 	"strings"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"vertualeventlive/backend/config"
@@ -35,16 +38,21 @@ func (h *PayoutHandler) Status(c *fiber.Ctx) error {
 	}
 
 	var (
-		stripeAccountID *string
-		wipayAccountID  *string
-		paypalAccountID *string
-		payoutGateway   *string
-		stripePayoutOK  bool
+		stripeAccountID          *string
+		wipayAccountID           *string
+		paypalAccountID          *string
+		payoutGateway            *string
+		stripePayoutOK           bool
+		paypalPaymentsReceivable bool
+		paypalEmailConfirmed     bool
+		paypalOnboardingComplete bool
 	)
 	err := h.DB.QueryRow(context.Background(),
-		`SELECT stripe_account_id, wipay_account_id, paypal_account_id, payout_gateway, payout_enabled
+		`SELECT stripe_account_id, wipay_account_id, paypal_merchant_id, payout_gateway, payout_enabled,
+		        paypal_payments_receivable, paypal_email_confirmed, paypal_onboarding_complete
 		 FROM connected_accounts WHERE user_id = $1`, hostID,
-	).Scan(&stripeAccountID, &wipayAccountID, &paypalAccountID, &payoutGateway, &stripePayoutOK)
+	).Scan(&stripeAccountID, &wipayAccountID, &paypalAccountID, &payoutGateway, &stripePayoutOK,
+		&paypalPaymentsReceivable, &paypalEmailConfirmed, &paypalOnboardingComplete)
 	if err != nil {
 		return c.JSON(fiber.Map{
 			"active_gateway": "",
@@ -69,7 +77,8 @@ func (h *PayoutHandler) Status(c *fiber.Ctx) error {
 	}
 	paypal := gatewayStatus{}
 	if paypalAccountID != nil {
-		paypal = gatewayStatus{Connected: true, AccountID: *paypalAccountID, PayoutEnabled: true}
+		ready := paypalPaymentsReceivable && paypalEmailConfirmed && paypalOnboardingComplete
+		paypal = gatewayStatus{Connected: ready, AccountID: *paypalAccountID, PayoutEnabled: ready}
 	}
 
 	return c.JSON(fiber.Map{
@@ -110,7 +119,10 @@ func (h *PayoutHandler) Activate(c *fiber.Ctx) error {
 		 WHERE user_id = $2 AND CASE $1
 		   WHEN 'stripe' THEN stripe_account_id IS NOT NULL AND payout_enabled = true
 		   WHEN 'wipay' THEN wipay_account_id IS NOT NULL
-		   WHEN 'paypal' THEN paypal_account_id IS NOT NULL
+		   WHEN 'paypal' THEN paypal_merchant_id IS NOT NULL
+		     AND paypal_payments_receivable = true
+		     AND paypal_email_confirmed = true
+		     AND paypal_onboarding_complete = true
 		   ELSE false END`, req.Gateway, hostID,
 	)
 	if err != nil {
@@ -169,35 +181,70 @@ func (h *PayoutHandler) ConnectWiPay(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"connected": true, "active_gateway": "wipay"})
 }
 
-// ConnectPayPal saves the host's PayPal email and makes PayPal the active
-// payout gateway. PayPal Payouts sends to a receiver email directly, so no
-// separate onboarding link is needed either.
+// ConnectPayPal starts PayPal Commerce Platform hosted seller onboarding.
+// The platform never asks for or stores the host's PayPal password or bank data.
 func (h *PayoutHandler) ConnectPayPal(c *fiber.Ctx) error {
 	hostID, ok := c.Locals("user_id").(string)
 	if !ok || hostID == "" {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
 	}
 
-	var req connectAccountRequest
-	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	if h.PayPal == nil || !h.PayPal.MarketplaceEnabled() {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "PayPal marketplace onboarding is not configured yet"})
 	}
-	req.AccountID = strings.TrimSpace(strings.ToLower(req.AccountID))
-	if req.AccountID == "" || !strings.Contains(req.AccountID, "@") {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "a valid PayPal email is required"})
-	}
-
+	trackingID := uuid.NewString()
 	if _, err := h.DB.Exec(context.Background(),
-		`INSERT INTO connected_accounts (user_id, paypal_account_id, payout_gateway)
-		 VALUES ($1, $2, 'paypal')
-		 ON CONFLICT (user_id) DO UPDATE SET paypal_account_id = EXCLUDED.paypal_account_id, payout_gateway = 'paypal'`,
-		hostID, req.AccountID,
+		`INSERT INTO connected_accounts (user_id, paypal_tracking_id)
+		 VALUES ($1, $2)
+		 ON CONFLICT (user_id) DO UPDATE SET paypal_tracking_id = EXCLUDED.paypal_tracking_id`,
+		hostID, trackingID,
 	); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save PayPal account"})
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to start PayPal onboarding"})
 	}
-	auditPayoutEvent(h.DB, c, hostID, "paypal_account_connected")
+	returnURL := fmt.Sprintf("%s/api/v1/connect/paypal/complete?state=%s",
+		strings.TrimRight(h.Cfg.PublicAPIURL, "/"), url.QueryEscape(trackingID))
+	actionURL, err := h.PayPal.CreateSellerReferral(trackingID, returnURL)
+	if err != nil {
+		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": err.Error()})
+	}
+	auditPayoutEvent(h.DB, c, hostID, "paypal_onboarding_started")
+	return c.JSON(fiber.Map{"url": actionURL})
+}
 
-	return c.JSON(fiber.Map{"connected": true, "active_gateway": "paypal"})
+func (h *PayoutHandler) PayPalComplete(c *fiber.Ctx) error {
+	trackingID := strings.TrimSpace(c.Query("state"))
+	merchantID := strings.TrimSpace(c.Query("merchantIdInPayPal"))
+	if trackingID == "" || merchantID == "" {
+		return c.Redirect(h.Cfg.FrontendURL+"/dashboard/payouts?paypal=error", fiber.StatusSeeOther)
+	}
+	var hostID string
+	if err := h.DB.QueryRow(context.Background(),
+		`SELECT user_id FROM connected_accounts WHERE paypal_tracking_id = $1`, trackingID,
+	).Scan(&hostID); err != nil {
+		return c.Redirect(h.Cfg.FrontendURL+"/dashboard/payouts?paypal=error", fiber.StatusSeeOther)
+	}
+	status, err := h.PayPal.GetSellerStatus(merchantID)
+	if err != nil {
+		return c.Redirect(h.Cfg.FrontendURL+"/dashboard/payouts?paypal=verification_failed", fiber.StatusSeeOther)
+	}
+	ready := status.PaymentsReceivable && status.EmailConfirmed
+	_, err = h.DB.Exec(context.Background(),
+		`UPDATE connected_accounts
+		 SET paypal_merchant_id = $1, paypal_account_id = NULL,
+		     paypal_payments_receivable = $2, paypal_email_confirmed = $3,
+		     paypal_onboarding_complete = $4,
+		     payout_gateway = CASE WHEN $4 THEN 'paypal' ELSE payout_gateway END
+		 WHERE user_id = $5 AND paypal_tracking_id = $6`,
+		status.MerchantID, status.PaymentsReceivable, status.EmailConfirmed, ready, hostID, trackingID,
+	)
+	if err != nil {
+		return c.Redirect(h.Cfg.FrontendURL+"/dashboard/payouts?paypal=error", fiber.StatusSeeOther)
+	}
+	result := "pending"
+	if ready {
+		result = "connected"
+	}
+	return c.Redirect(h.Cfg.FrontendURL+"/dashboard/payouts?paypal="+result, fiber.StatusSeeOther)
 }
 
 // Balance sums ledger entries not yet paid out to the host.
@@ -248,6 +295,9 @@ func (h *PayoutHandler) Payout(c *fiber.Ctx) error {
 	if gateway == "stripe" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Stripe payouts happen automatically — nothing to trigger"})
 	}
+	if gateway == "paypal" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "PayPal ticket proceeds settle automatically — nothing to trigger"})
+	}
 
 	var pending float64
 	if err := h.DB.QueryRow(context.Background(),
@@ -270,15 +320,6 @@ func (h *PayoutHandler) Payout(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "no WiPay account connected"})
 		}
 		ref, err := h.WiPay.SendPayout(*wipayAccountID, pending, "")
-		if err != nil {
-			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": err.Error()})
-		}
-		transactionRef = ref
-	case "paypal":
-		if paypalAccountID == nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "no PayPal account connected"})
-		}
-		ref, err := h.PayPal.SendPayout(*paypalAccountID, pending, "Virtual Event Plus ticket revenue")
 		if err != nil {
 			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": err.Error()})
 		}

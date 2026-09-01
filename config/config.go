@@ -6,10 +6,11 @@ import (
 )
 
 type Config struct {
-	DatabaseURL string
-	RedisURL    string
-	JWTSecret   string
-	FrontendURL string
+	DatabaseURL  string
+	RedisURL     string
+	JWTSecret    string
+	FrontendURL  string
+	PublicAPIURL string
 	// Comma-separated list of origins allowed to call the API cross-origin.
 	// Kept separate from FrontendURL, which is reused elsewhere (Stripe
 	// Connect redirect links, email links) as a single URL and would break
@@ -41,17 +42,21 @@ type Config struct {
 	WipayEnvironment   string
 
 	// PayPal — Payouts API (https://developer.paypal.com/docs/payouts/).
-	PaypalClientID     string
-	PaypalClientSecret string
-	PaypalEnvironment  string
+	PaypalClientID          string
+	PaypalClientSecret      string
+	PaypalEnvironment       string
+	PaypalPartnerMerchantID string
+	PaypalBNCode            string
+	PaypalWebhookID         string
 }
 
 func Load() *Config {
 	return &Config{
-		DatabaseURL: getEnv("DATABASE_URL", ""),
-		RedisURL:    getEnv("REDIS_URL", "redis://localhost:6379"),
-		JWTSecret:   getEnv("JWT_SECRET", "change-me-in-production"),
-		FrontendURL: getEnv("FRONTEND_URL", "http://localhost:3000"),
+		DatabaseURL:  getEnv("DATABASE_URL", ""),
+		RedisURL:     getEnv("REDIS_URL", "redis://localhost:6379"),
+		JWTSecret:    getEnv("JWT_SECRET", "change-me-in-production"),
+		FrontendURL:  getEnv("FRONTEND_URL", "http://localhost:3000"),
+		PublicAPIURL: getEnv("PUBLIC_API_URL", "http://localhost:8080"),
 		CorsAllowedOrigins: getEnv("CORS_ALLOWED_ORIGINS",
 			"https://virtualeventplus.com,https://www.virtualeventplus.com,https://virtualeventlivefrontend-production.up.railway.app,http://localhost:5173"),
 		Port:                getEnv("PORT", "8080"),
@@ -76,9 +81,12 @@ func Load() *Config {
 		WipayAPIKey:        getEnv("WIPAY_API_KEY", ""),
 		WipayEnvironment:   getEnv("WIPAY_ENVIRONMENT", "sandbox"),
 
-		PaypalClientID:     getEnv("PAYPAL_CLIENT_ID", ""),
-		PaypalClientSecret: getEnv("PAYPAL_CLIENT_SECRET", ""),
-		PaypalEnvironment:  getEnv("PAYPAL_ENVIRONMENT", "sandbox"),
+		PaypalClientID:          getEnv("PAYPAL_CLIENT_ID", ""),
+		PaypalClientSecret:      getEnv("PAYPAL_CLIENT_SECRET", ""),
+		PaypalEnvironment:       getEnv("PAYPAL_ENVIRONMENT", "sandbox"),
+		PaypalPartnerMerchantID: getEnv("PAYPAL_PARTNER_MERCHANT_ID", ""),
+		PaypalBNCode:            getEnv("PAYPAL_BN_CODE", ""),
+		PaypalWebhookID:         getEnv("PAYPAL_WEBHOOK_ID", ""),
 	}
 }
 
