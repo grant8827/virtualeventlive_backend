@@ -13,11 +13,6 @@ import (
 )
 
 func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) {
-	paypalSvc := &services.PayPalService{
-		ClientID: cfg.PaypalClientID, ClientSecret: cfg.PaypalClientSecret,
-		Environment: cfg.PaypalEnvironment, PartnerMerchantID: cfg.PaypalPartnerMerchantID,
-		BNCode: cfg.PaypalBNCode, WebhookID: cfg.PaypalWebhookID,
-	}
 	emailSvc := &services.EmailService{
 		APIKey:    cfg.ResendAPIKey,
 		FromEmail: cfg.FromEmail,
@@ -72,7 +67,7 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 			APIKey:        cfg.WipayAPIKey,
 			Environment:   cfg.WipayEnvironment,
 		},
-		PayPal: paypalSvc,
+		PayPal: &services.PayPalService{ClientID: cfg.PaypalClientID, ClientSecret: cfg.PaypalClientSecret, Environment: cfg.PaypalEnvironment},
 	}
 	v1.Get("/events/public", eventH.ListPublic)
 	v1.Get("/events/:id", eventH.GetByID)
@@ -129,24 +124,26 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 			APIKey:      cfg.WipayAPIKey,
 			Environment: cfg.WipayEnvironment,
 		},
-		PayPal: paypalSvc,
+		PayPal: &services.PayPalService{
+			ClientID:     cfg.PaypalClientID,
+			ClientSecret: cfg.PaypalClientSecret,
+			Environment:  cfg.PaypalEnvironment,
+		},
 	}
 	v1.Get("/connect/status", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutAuth, payoutH.Status)
 	v1.Post("/connect/wipay", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutAuth, payoutH.ConnectWiPay)
 	v1.Post("/connect/paypal", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutAuth, payoutH.ConnectPayPal)
-	v1.Get("/connect/paypal/complete", payoutH.PayPalComplete)
 	v1.Post("/connect/activate", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutAuth, payoutH.Activate)
 	v1.Post("/connect/deactivate", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutAuth, payoutH.Deactivate)
 	v1.Get("/connect/balance", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutAuth, payoutH.Balance)
 	v1.Post("/connect/payout", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutAuth, payoutH.Payout)
 
 	// Tickets
-	ticketH := &handlers.TicketHandler{DB: db, Cfg: cfg, Email: emailSvc, PayPal: paypalSvc}
+	ticketH := &handlers.TicketHandler{DB: db, Cfg: cfg, Email: emailSvc}
 	v1.Get("/tickets/lookup", ticketH.Lookup)
 	v1.Get("/tickets/enter", ticketH.Enter)
 	v1.Post("/tickets/guest-purchase", ticketH.GuestPurchase)
 	v1.Post("/tickets/purchase", middleware.Protected(cfg.JWTSecret), ticketH.Purchase)
-	v1.Get("/tickets/paypal/complete", ticketH.PayPalComplete)
 	v1.Get("/tickets/mine", middleware.Protected(cfg.JWTSecret), ticketH.ListMine)
 	// Door-scanner check-in — host only, used by the dashboard's Scan Tickets page
 	v1.Post("/tickets/checkin", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), ticketH.CheckIn)
