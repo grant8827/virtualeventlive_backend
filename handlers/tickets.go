@@ -337,18 +337,17 @@ func (h *TicketHandler) GuestPurchase(c *fiber.Ctx) error {
 
 	// Stripe checkout
 	var stripeAccountID *string
-	var payoutGateway string
 	err = h.DB.QueryRow(context.Background(),
-		`SELECT ca.stripe_account_id, ca.payout_gateway FROM connected_accounts ca
+		`SELECT ca.stripe_account_id FROM connected_accounts ca
 		 JOIN events e ON e.host_id = ca.user_id
-		 WHERE e.id = $1 AND ca.payout_gateway IS NOT NULL
-		   AND (ca.payout_gateway <> 'stripe' OR ca.payout_enabled = true)`,
+		 WHERE e.id = $1 AND ca.payout_gateway = 'stripe'
+		   AND ca.payout_enabled = true`,
 		req.EventID,
-	).Scan(&stripeAccountID, &payoutGateway)
+	).Scan(&stripeAccountID)
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "host has not connected a payout account"})
 	}
-	if payoutGateway == "stripe" && stripeAccountID == nil {
+	if stripeAccountID == nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "host has not completed Stripe onboarding"})
 	}
 
@@ -379,16 +378,11 @@ func (h *TicketHandler) GuestPurchase(c *fiber.Ctx) error {
 			"guest_email": req.Email,
 		},
 	}
-	// Stripe-connected hosts get paid via a destination charge at checkout time.
-	// WiPay/PayPal hosts are charged into the platform's balance and paid out
-	// separately (see PayoutHandler.Payout), so no transfer here.
-	if payoutGateway == "stripe" {
-		params.PaymentIntentData = &stripe.CheckoutSessionPaymentIntentDataParams{
-			ApplicationFeeAmount: stripe.Int64(int64(split.PlatformFee * 100)),
-			TransferData: &stripe.CheckoutSessionPaymentIntentDataTransferDataParams{
-				Destination: stripe.String(*stripeAccountID),
-			},
-		}
+	params.PaymentIntentData = &stripe.CheckoutSessionPaymentIntentDataParams{
+		ApplicationFeeAmount: stripe.Int64(int64(split.PlatformFee * 100)),
+		TransferData: &stripe.CheckoutSessionPaymentIntentDataTransferDataParams{
+			Destination: stripe.String(*stripeAccountID),
+		},
 	}
 
 	s, err := session.New(params)
@@ -424,25 +418,24 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 		eventTitle      string
 		ticketPrice     float64
 		stripeAccountID *string
-		payoutGateway   string
 		buyerEmail      string
 	)
 	err := h.DB.QueryRow(context.Background(),
-		`SELECT e.title, e.ticket_price, ca.stripe_account_id, ca.payout_gateway, u.email
+		`SELECT e.title, e.ticket_price, ca.stripe_account_id, u.email
 		 FROM events e
 		 JOIN connected_accounts ca ON ca.user_id = e.host_id
 		 JOIN users u ON u.id = $2
 		 WHERE e.id = $1 AND e.is_active = true AND e.venue_paid = true AND e.ends_at > NOW()
-		   AND ca.payout_gateway IS NOT NULL
-		   AND (ca.payout_gateway <> 'stripe' OR ca.payout_enabled = true)`,
+		   AND ca.payout_gateway = 'stripe'
+		   AND ca.payout_enabled = true`,
 		req.EventID, buyerID,
-	).Scan(&eventTitle, &ticketPrice, &stripeAccountID, &payoutGateway, &buyerEmail)
+	).Scan(&eventTitle, &ticketPrice, &stripeAccountID, &buyerEmail)
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "event not found, not yet published, or host has not connected a payout account",
 		})
 	}
-	if payoutGateway == "stripe" && stripeAccountID == nil {
+	if stripeAccountID == nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "host has not completed Stripe onboarding"})
 	}
 
@@ -473,13 +466,11 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 			"buyer_id": buyerID,
 		},
 	}
-	if payoutGateway == "stripe" {
-		params.PaymentIntentData = &stripe.CheckoutSessionPaymentIntentDataParams{
-			ApplicationFeeAmount: stripe.Int64(int64(split.PlatformFee * 100)),
-			TransferData: &stripe.CheckoutSessionPaymentIntentDataTransferDataParams{
-				Destination: stripe.String(*stripeAccountID),
-			},
-		}
+	params.PaymentIntentData = &stripe.CheckoutSessionPaymentIntentDataParams{
+		ApplicationFeeAmount: stripe.Int64(int64(split.PlatformFee * 100)),
+		TransferData: &stripe.CheckoutSessionPaymentIntentDataTransferDataParams{
+			Destination: stripe.String(*stripeAccountID),
+		},
 	}
 
 	s, err := session.New(params)

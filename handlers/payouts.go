@@ -11,10 +11,8 @@ import (
 	"vertualeventlive/backend/services"
 )
 
-// PayoutHandler covers the gateway-agnostic parts of host payouts: which
-// gateway a host has chosen (Stripe, WiPay, or PayPal), their pending balance,
-// and triggering a manual payout for gateways that aren't paid automatically
-// at checkout time the way Stripe destination charges are.
+// PayoutHandler manages Stripe onboarding and preserves legacy payout support
+// for balances created before WiPay and PayPal were disabled for new setups.
 type PayoutHandler struct {
 	DB     *pgxpool.Pool
 	Cfg    *config.Config
@@ -80,10 +78,6 @@ func (h *PayoutHandler) Status(c *fiber.Ctx) error {
 	})
 }
 
-type connectAccountRequest struct {
-	AccountID string `json:"account_id"`
-}
-
 type activateGatewayRequest struct {
 	Gateway string `json:"gateway"`
 }
@@ -101,17 +95,16 @@ func (h *PayoutHandler) Activate(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
 	}
 	req.Gateway = strings.ToLower(strings.TrimSpace(req.Gateway))
-	if req.Gateway != "stripe" && req.Gateway != "wipay" && req.Gateway != "paypal" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "gateway must be stripe, wipay, or paypal"})
+	if req.Gateway != "stripe" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Stripe is currently the only available payout provider; PayPal and WiPay are coming soon"})
 	}
 
 	result, err := h.DB.Exec(context.Background(),
 		`UPDATE connected_accounts SET payout_gateway = $1
-		 WHERE user_id = $2 AND CASE $1
-		   WHEN 'stripe' THEN stripe_account_id IS NOT NULL AND payout_enabled = true
-		   WHEN 'wipay' THEN wipay_account_id IS NOT NULL
-		   WHEN 'paypal' THEN paypal_account_id IS NOT NULL
-		   ELSE false END`, req.Gateway, hostID,
+		 WHERE user_id = $2
+		   AND $1 = 'stripe'
+		   AND stripe_account_id IS NOT NULL
+		   AND payout_enabled = true`, req.Gateway, hostID,
 	)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to activate payout account"})
@@ -138,66 +131,14 @@ func (h *PayoutHandler) Deactivate(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"active_gateway": ""})
 }
 
-// ConnectWiPay saves the host's WiPay account number and makes WiPay the
-// active payout gateway. WiPay has no OAuth-style onboarding like Stripe
-// Connect — the host just tells us where to send their cut.
+// ConnectWiPay is reserved for the future WiPay integration.
 func (h *PayoutHandler) ConnectWiPay(c *fiber.Ctx) error {
-	hostID, ok := c.Locals("user_id").(string)
-	if !ok || hostID == "" {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
-	}
-
-	var req connectAccountRequest
-	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
-	}
-	req.AccountID = strings.TrimSpace(req.AccountID)
-	if req.AccountID == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "account_id is required"})
-	}
-
-	if _, err := h.DB.Exec(context.Background(),
-		`INSERT INTO connected_accounts (user_id, wipay_account_id, payout_gateway)
-		 VALUES ($1, $2, 'wipay')
-		 ON CONFLICT (user_id) DO UPDATE SET wipay_account_id = EXCLUDED.wipay_account_id, payout_gateway = 'wipay'`,
-		hostID, req.AccountID,
-	); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save WiPay account"})
-	}
-	auditPayoutEvent(h.DB, c, hostID, "wipay_account_connected")
-
-	return c.JSON(fiber.Map{"connected": true, "active_gateway": "wipay"})
+	return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "WiPay payouts are coming soon"})
 }
 
-// ConnectPayPal saves the host's PayPal email and makes PayPal the active
-// payout gateway. PayPal Payouts sends to a receiver email directly, so no
-// separate onboarding link is needed either.
+// ConnectPayPal is reserved for the future PayPal integration.
 func (h *PayoutHandler) ConnectPayPal(c *fiber.Ctx) error {
-	hostID, ok := c.Locals("user_id").(string)
-	if !ok || hostID == "" {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
-	}
-
-	var req connectAccountRequest
-	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
-	}
-	req.AccountID = strings.TrimSpace(strings.ToLower(req.AccountID))
-	if req.AccountID == "" || !strings.Contains(req.AccountID, "@") {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "a valid PayPal email is required"})
-	}
-
-	if _, err := h.DB.Exec(context.Background(),
-		`INSERT INTO connected_accounts (user_id, paypal_account_id, payout_gateway)
-		 VALUES ($1, $2, 'paypal')
-		 ON CONFLICT (user_id) DO UPDATE SET paypal_account_id = EXCLUDED.paypal_account_id, payout_gateway = 'paypal'`,
-		hostID, req.AccountID,
-	); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save PayPal account"})
-	}
-	auditPayoutEvent(h.DB, c, hostID, "paypal_account_connected")
-
-	return c.JSON(fiber.Map{"connected": true, "active_gateway": "paypal"})
+	return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "PayPal payouts are coming soon"})
 }
 
 // Balance sums ledger entries not yet paid out to the host.
