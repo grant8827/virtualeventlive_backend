@@ -153,6 +153,9 @@ func (p *PayPalService) CaptureCheckoutOrder(orderID string) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
+	// A stable request ID makes capture retries idempotent if PayPal succeeds
+	// but our database transaction or network response fails afterward.
+	req.Header.Set("PayPal-Request-Id", "capture-"+orderID)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"net/mail"
 	"strings"
 
 	"github.com/gofiber/fiber/v2"
@@ -11,8 +12,7 @@ import (
 	"vertualeventlive/backend/services"
 )
 
-// PayoutHandler manages Stripe onboarding and preserves legacy payout support
-// for balances created before WiPay and PayPal were disabled for new setups.
+// PayoutHandler manages host payout accounts.
 type PayoutHandler struct {
 	DB     *pgxpool.Pool
 	Cfg    *config.Config
@@ -67,7 +67,7 @@ func (h *PayoutHandler) Status(c *fiber.Ctx) error {
 	}
 	paypal := gatewayStatus{}
 	if paypalAccountID != nil {
-		paypal = gatewayStatus{Connected: true, AccountID: *paypalAccountID, PayoutEnabled: true}
+		paypal = gatewayStatus{Connected: true, AccountID: *paypalAccountID, PayoutEnabled: activeGateway == "paypal" && h.PayPal != nil && h.PayPal.Enabled()}
 	}
 
 	return c.JSON(fiber.Map{
@@ -95,17 +95,22 @@ func (h *PayoutHandler) Activate(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
 	}
 	req.Gateway = strings.ToLower(strings.TrimSpace(req.Gateway))
-	if req.Gateway != "stripe" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Stripe is currently the only available payout provider; PayPal and WiPay are coming soon"})
+	if req.Gateway != "stripe" && req.Gateway != "paypal" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "available payout providers are Stripe and PayPal"})
 	}
 
-	result, err := h.DB.Exec(context.Background(),
-		`UPDATE connected_accounts SET payout_gateway = $1
-		 WHERE user_id = $2
-		   AND $1 = 'stripe'
-		   AND stripe_account_id IS NOT NULL
-		   AND payout_enabled = true`, req.Gateway, hostID,
-	)
+	if req.Gateway == "paypal" && (h.PayPal == nil || !h.PayPal.Enabled()) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "PayPal is not configured on the platform"})
+	}
+
+	query := `UPDATE connected_accounts SET payout_gateway = 'paypal'
+		 WHERE user_id = $1 AND paypal_account_id IS NOT NULL`
+	args := []any{hostID}
+	if req.Gateway == "stripe" {
+		query = `UPDATE connected_accounts SET payout_gateway = 'stripe'
+			 WHERE user_id = $1 AND stripe_account_id IS NOT NULL AND payout_enabled = true`
+	}
+	result, err := h.DB.Exec(context.Background(), query, args...)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to activate payout account"})
 	}
@@ -136,9 +141,40 @@ func (h *PayoutHandler) ConnectWiPay(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "WiPay payouts are coming soon"})
 }
 
-// ConnectPayPal is reserved for the future PayPal integration.
+type connectPayPalRequest struct {
+	Email string `json:"email"`
+}
+
+// ConnectPayPal saves the verified email destination the Payouts API will use.
+// Connecting also makes PayPal active, matching Stripe's onboarding behavior.
 func (h *PayoutHandler) ConnectPayPal(c *fiber.Ctx) error {
-	return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "PayPal payouts are coming soon"})
+	hostID, ok := c.Locals("user_id").(string)
+	if !ok || hostID == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+	if h.PayPal == nil || !h.PayPal.Enabled() {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "PayPal is not configured on the platform"})
+	}
+	var req connectPayPalRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	}
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+	address, err := mail.ParseAddress(req.Email)
+	if err != nil || !strings.EqualFold(address.Address, req.Email) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "enter a valid PayPal account email"})
+	}
+	_, err = h.DB.Exec(context.Background(),
+		`INSERT INTO connected_accounts (user_id, paypal_account_id, payout_gateway)
+		 VALUES ($1, $2, 'paypal')
+		 ON CONFLICT (user_id) DO UPDATE
+		 SET paypal_account_id = EXCLUDED.paypal_account_id, payout_gateway = 'paypal'`,
+		hostID, req.Email)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save PayPal account"})
+	}
+	auditPayoutEvent(h.DB, c, hostID, "paypal_connected")
+	return c.JSON(fiber.Map{"connected": true, "active_gateway": "paypal", "account_id": req.Email})
 }
 
 // Balance sums ledger entries not yet paid out to the host.
@@ -158,8 +194,8 @@ func (h *PayoutHandler) Balance(c *fiber.Ctx) error {
 		`SELECT COALESCE(SUM(le.host_payout), 0)
 		 FROM ledger_entries le
 		 JOIN events e ON e.id = le.event_id
-		 WHERE e.host_id = $1 AND le.payout_status = 'pending'`,
-		hostID,
+		 WHERE e.host_id = $1 AND le.payout_status = 'pending' AND le.payout_gateway = $2`,
+		hostID, gateway,
 	).Scan(&pending)
 
 	return c.JSON(fiber.Map{
@@ -178,9 +214,21 @@ func (h *PayoutHandler) Payout(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
 	}
 
+	ctx := context.Background()
+	tx, err := h.DB.Begin(ctx)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to start payout"})
+	}
+	defer tx.Rollback(ctx)
+	// Serialize payouts per host. Without this lock two quick requests could
+	// submit the same pending balance twice to an external payout provider.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, hostID); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to lock payout"})
+	}
+
 	var gateway string
 	var wipayAccountID, paypalAccountID *string
-	err := h.DB.QueryRow(context.Background(),
+	err = tx.QueryRow(ctx,
 		`SELECT payout_gateway, wipay_account_id, paypal_account_id FROM connected_accounts WHERE user_id = $1`, hostID,
 	).Scan(&gateway, &wipayAccountID, &paypalAccountID)
 	if err != nil {
@@ -191,12 +239,12 @@ func (h *PayoutHandler) Payout(c *fiber.Ctx) error {
 	}
 
 	var pending float64
-	if err := h.DB.QueryRow(context.Background(),
+	if err := tx.QueryRow(ctx,
 		`SELECT COALESCE(SUM(le.host_payout), 0)
 		 FROM ledger_entries le
 		 JOIN events e ON e.id = le.event_id
-		 WHERE e.host_id = $1 AND le.payout_status = 'pending'`,
-		hostID,
+		 WHERE e.host_id = $1 AND le.payout_status = 'pending' AND le.payout_gateway = $2`,
+		hostID, gateway,
 	).Scan(&pending); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to calculate balance"})
 	}
@@ -216,7 +264,7 @@ func (h *PayoutHandler) Payout(c *fiber.Ctx) error {
 		}
 		transactionRef = ref
 	case "paypal":
-		if paypalAccountID == nil {
+		if paypalAccountID == nil || h.PayPal == nil || !h.PayPal.Enabled() {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "no PayPal account connected"})
 		}
 		ref, err := h.PayPal.SendPayout(*paypalAccountID, pending, "Virtual Event Plus ticket revenue")
@@ -228,13 +276,17 @@ func (h *PayoutHandler) Payout(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "unknown payout gateway"})
 	}
 
-	if _, err := h.DB.Exec(context.Background(),
+	if _, err := tx.Exec(ctx,
 		`UPDATE ledger_entries le SET payout_status = 'paid', payout_gateway = $2, paid_out_at = NOW()
 		 FROM events e
-		 WHERE le.event_id = e.id AND e.host_id = $1 AND le.payout_status = 'pending'`,
+		 WHERE le.event_id = e.id AND e.host_id = $1 AND le.payout_status = 'pending'
+		   AND le.payout_gateway = $2`,
 		hostID, gateway,
 	); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "payout sent but failed to update ledger — contact support"})
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "payout sent but failed to finalize ledger — contact support"})
 	}
 	auditPayoutEvent(h.DB, c, hostID, "payout_sent_"+gateway)
 

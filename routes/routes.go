@@ -139,10 +139,14 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	v1.Post("/connect/payout", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutAuth, payoutH.Payout)
 
 	// Tickets
-	ticketH := &handlers.TicketHandler{DB: db, Cfg: cfg, Email: emailSvc}
+	ticketH := &handlers.TicketHandler{
+		DB: db, Cfg: cfg, Email: emailSvc,
+		PayPal: &services.PayPalService{ClientID: cfg.PaypalClientID, ClientSecret: cfg.PaypalClientSecret, Environment: cfg.PaypalEnvironment},
+	}
 	v1.Get("/tickets/lookup", ticketH.Lookup)
 	v1.Get("/tickets/enter", ticketH.Enter)
 	v1.Post("/tickets/guest-purchase", ticketH.GuestPurchase)
+	v1.Get("/tickets/paypal/complete", ticketH.PayPalComplete)
 	v1.Post("/tickets/purchase", middleware.Protected(cfg.JWTSecret), ticketH.Purchase)
 	v1.Get("/tickets/mine", middleware.Protected(cfg.JWTSecret), ticketH.ListMine)
 	// Door-scanner check-in — host only, used by the dashboard's Scan Tickets page
