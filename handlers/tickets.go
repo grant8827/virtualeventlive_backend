@@ -345,10 +345,10 @@ func (h *TicketHandler) GuestPurchase(c *fiber.Ctx) error {
 	}
 
 	if payoutGateway == "paypal" {
-		if paypalAccount == nil || h.PayPal == nil || !h.PayPal.Enabled() {
+		if paypalAccount == nil || h.PayPal == nil || !h.PayPal.PartnerEnabled() {
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "host PayPal checkout is not available"})
 		}
-		return h.createPayPalTicketCheckout(c, req.EventID, eventTitle, req.Email, nil, ticketPrice)
+		return h.createPayPalTicketCheckout(c, req.EventID, eventTitle, req.Email, nil, *paypalAccount, ticketPrice)
 	}
 	if payoutGateway != "stripe" {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "host has not selected a payout account"})
@@ -458,10 +458,10 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"access_token": accessToken, "event_id": req.EventID})
 	}
 	if payoutGateway == "paypal" {
-		if paypalAccountID == nil || h.PayPal == nil || !h.PayPal.Enabled() {
+		if paypalAccountID == nil || h.PayPal == nil || !h.PayPal.PartnerEnabled() {
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "host PayPal checkout is not available"})
 		}
-		return h.createPayPalTicketCheckout(c, req.EventID, eventTitle, buyerEmail, &buyerID, ticketPrice)
+		return h.createPayPalTicketCheckout(c, req.EventID, eventTitle, buyerEmail, &buyerID, *paypalAccountID, ticketPrice)
 	}
 	if h.Cfg.StripeSecretKey == "" {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Stripe payment processing is not configured"})
@@ -512,19 +512,21 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"checkout_url": s.URL})
 }
 
-func (h *TicketHandler) createPayPalTicketCheckout(c *fiber.Ctx, eventID, eventTitle, buyerEmail string, buyerID *string, amount float64) error {
+func (h *TicketHandler) createPayPalTicketCheckout(c *fiber.Ctx, eventID, eventTitle, buyerEmail string, buyerID *string, merchantID string, amount float64) error {
 	returnURL := strings.TrimRight(c.BaseURL(), "/") + "/api/v1/tickets/paypal/complete"
+	split := services.CalculateSplit(amount)
 	order, err := h.PayPal.CreateCheckoutOrder(services.CheckoutOrderRequest{
 		Amount: amount, Description: eventTitle + " — Ticket", Reference: "ticket-" + eventID,
 		ReturnURL: returnURL, CancelURL: h.Cfg.FrontendURL + "/events/" + eventID,
+		PayeeMerchantID: merchantID, PlatformFee: split.PlatformFee,
 	})
 	if err != nil {
 		fmt.Printf("paypal ticket checkout error: %v\n", err)
 		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "PayPal could not create checkout"})
 	}
 	if _, err := h.DB.Exec(context.Background(),
-		`INSERT INTO paypal_ticket_orders (order_id, event_id, buyer_id, buyer_email, amount)
-		 VALUES ($1,$2,$3,$4,$5)`, order.ID, eventID, buyerID, buyerEmail, amount); err != nil {
+		`INSERT INTO paypal_ticket_orders (order_id, event_id, buyer_id, buyer_email, amount, merchant_id)
+		 VALUES ($1,$2,$3,$4,$5,$6)`, order.ID, eventID, buyerID, buyerEmail, amount, merchantID); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save PayPal checkout"})
 	}
 	return c.JSON(fiber.Map{"checkout_provider": "paypal", "checkout_url": order.ApprovalURL})
@@ -543,20 +545,20 @@ func (h *TicketHandler) PayPalComplete(c *fiber.Ctx) error {
 		return c.Redirect(redirect + "?payment=failed")
 	}
 	defer tx.Rollback(context.Background())
-	var eventID, buyerEmail, status string
+	var eventID, buyerEmail, status, merchantID string
 	var buyerID *string
 	var amount float64
 	if err := tx.QueryRow(context.Background(),
-		`SELECT event_id, buyer_id, buyer_email, amount, status
+		`SELECT event_id, buyer_id, buyer_email, amount, status, merchant_id
 		 FROM paypal_ticket_orders WHERE order_id = $1 FOR UPDATE`, orderID,
-	).Scan(&eventID, &buyerID, &buyerEmail, &amount, &status); err != nil {
+	).Scan(&eventID, &buyerID, &buyerEmail, &amount, &status, &merchantID); err != nil {
 		return c.Redirect(redirect + "?payment=failed")
 	}
 	redirect += "?email=" + url.QueryEscape(buyerEmail)
 	if status == "completed" {
 		return c.Redirect(redirect)
 	}
-	if err := h.PayPal.CaptureCheckoutOrder(orderID); err != nil {
+	if err := h.PayPal.CaptureCheckoutOrder(orderID, merchantID); err != nil {
 		fmt.Printf("paypal ticket capture error: %v\n", err)
 		return c.Redirect(redirect + "&payment=failed")
 	}
@@ -574,7 +576,7 @@ func (h *TicketHandler) PayPalComplete(c *fiber.Ctx) error {
 	split := services.CalculateSplit(amount)
 	if _, err = tx.Exec(context.Background(),
 		`INSERT INTO ledger_entries (ticket_id,event_id,gross_amount,stripe_fee,platform_fee,host_payout,payout_gateway,payout_status)
-		 VALUES ($1,$2,$3,0,$4,$5,'paypal','pending')`, ticketID, eventID, amount, split.PlatformFee, split.HostShare()); err != nil {
+		 VALUES ($1,$2,$3,0,$4,$5,'paypal','paid')`, ticketID, eventID, amount, split.PlatformFee, split.HostShare()); err != nil {
 		return c.Redirect(redirect + "&payment=failed")
 	}
 	if _, err = tx.Exec(context.Background(), `UPDATE paypal_ticket_orders SET status='completed', ticket_id=$2, completed_at=NOW() WHERE order_id=$1 AND status='created'`, orderID, ticketID); err != nil {

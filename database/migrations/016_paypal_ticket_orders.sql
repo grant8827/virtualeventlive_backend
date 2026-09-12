@@ -7,12 +7,15 @@ CREATE TABLE IF NOT EXISTS paypal_ticket_orders (
     buyer_id UUID REFERENCES users(id) ON DELETE SET NULL,
     buyer_email TEXT NOT NULL,
     amount NUMERIC(10, 2) NOT NULL,
+    merchant_id VARCHAR(32),
     status VARCHAR(20) NOT NULL DEFAULT 'created'
         CHECK (status IN ('created', 'completed')),
     ticket_id UUID REFERENCES tickets(id) ON DELETE SET NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     completed_at TIMESTAMP WITH TIME ZONE
 );
+
+ALTER TABLE paypal_ticket_orders ADD COLUMN IF NOT EXISTS merchant_id VARCHAR(32);
 
 CREATE INDEX IF NOT EXISTS idx_paypal_ticket_orders_event_id
     ON paypal_ticket_orders(event_id);

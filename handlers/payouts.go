@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"net/mail"
 	"strings"
 
 	"github.com/gofiber/fiber/v2"
@@ -67,7 +66,7 @@ func (h *PayoutHandler) Status(c *fiber.Ctx) error {
 	}
 	paypal := gatewayStatus{}
 	if paypalAccountID != nil {
-		paypal = gatewayStatus{Connected: true, AccountID: *paypalAccountID, PayoutEnabled: activeGateway == "paypal" && h.PayPal != nil && h.PayPal.Enabled()}
+		paypal = gatewayStatus{Connected: true, AccountID: *paypalAccountID, PayoutEnabled: activeGateway == "paypal" && h.PayPal != nil && h.PayPal.PartnerEnabled()}
 	}
 
 	return c.JSON(fiber.Map{
@@ -99,7 +98,7 @@ func (h *PayoutHandler) Activate(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "available payout providers are Stripe and PayPal"})
 	}
 
-	if req.Gateway == "paypal" && (h.PayPal == nil || !h.PayPal.Enabled()) {
+	if req.Gateway == "paypal" && (h.PayPal == nil || !h.PayPal.PartnerEnabled()) {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "PayPal is not configured on the platform"})
 	}
 
@@ -141,40 +140,45 @@ func (h *PayoutHandler) ConnectWiPay(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "WiPay payouts are coming soon"})
 }
 
-type connectPayPalRequest struct {
-	Email string `json:"email"`
-}
-
-// ConnectPayPal saves the verified email destination the Payouts API will use.
-// Connecting also makes PayPal active, matching Stripe's onboarding behavior.
+// ConnectPayPal creates a one-time PayPal Partner Referrals signup URL.
 func (h *PayoutHandler) ConnectPayPal(c *fiber.Ctx) error {
 	hostID, ok := c.Locals("user_id").(string)
 	if !ok || hostID == "" {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
 	}
-	if h.PayPal == nil || !h.PayPal.Enabled() {
-		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "PayPal is not configured on the platform"})
+	if h.PayPal == nil || !h.PayPal.PartnerEnabled() {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "PayPal Commerce Platform is not configured"})
 	}
-	var req connectPayPalRequest
-	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
-	}
-	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
-	address, err := mail.ParseAddress(req.Email)
-	if err != nil || !strings.EqualFold(address.Address, req.Email) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "enter a valid PayPal account email"})
-	}
-	_, err = h.DB.Exec(context.Background(),
-		`INSERT INTO connected_accounts (user_id, paypal_account_id, payout_gateway)
-		 VALUES ($1, $2, 'paypal')
-		 ON CONFLICT (user_id) DO UPDATE
-		 SET paypal_account_id = EXCLUDED.paypal_account_id, payout_gateway = 'paypal'`,
-		hostID, req.Email)
+	returnURL := strings.TrimRight(c.BaseURL(), "/") + "/api/v1/connect/paypal/complete"
+	connectURL, err := h.PayPal.CreateSellerReferral(hostID, returnURL)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save PayPal account"})
+		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": err.Error()})
 	}
 	auditPayoutEvent(h.DB, c, hostID, "paypal_connected")
-	return c.JSON(fiber.Map{"connected": true, "active_gateway": "paypal", "account_id": req.Email})
+	return c.JSON(fiber.Map{"url": connectURL})
+}
+
+// CompletePayPal verifies PayPal's returned seller merchant ID and only
+// activates accounts that can receive payments and have a confirmed email.
+func (h *PayoutHandler) CompletePayPal(c *fiber.Ctx) error {
+	trackingID := strings.TrimSpace(c.Query("merchantId"))
+	merchantID := strings.TrimSpace(c.Query("merchantIdInPayPal"))
+	failURL := h.Cfg.FrontendURL + "/dashboard/payouts?paypal_connected=0"
+	if trackingID == "" || merchantID == "" || h.PayPal == nil {
+		return c.Redirect(failURL)
+	}
+	status, err := h.PayPal.GetSellerStatus(merchantID)
+	if err != nil || status.TrackingID != trackingID || !status.PaymentsReceivable || !status.PrimaryEmailConfirmed {
+		return c.Redirect(failURL)
+	}
+	result, err := h.DB.Exec(context.Background(),
+		`INSERT INTO connected_accounts (user_id, paypal_account_id, payout_gateway)
+		 VALUES ($1,$2,'paypal') ON CONFLICT (user_id) DO UPDATE
+		 SET paypal_account_id=EXCLUDED.paypal_account_id, payout_gateway='paypal'`, trackingID, merchantID)
+	if err != nil || result.RowsAffected() == 0 {
+		return c.Redirect(failURL)
+	}
+	return c.Redirect(h.Cfg.FrontendURL + "/dashboard/payouts?paypal_connected=1")
 }
 
 // Balance sums ledger entries not yet paid out to the host.

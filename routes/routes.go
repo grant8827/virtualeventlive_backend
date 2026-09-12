@@ -67,7 +67,7 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 			APIKey:        cfg.WipayAPIKey,
 			Environment:   cfg.WipayEnvironment,
 		},
-		PayPal: &services.PayPalService{ClientID: cfg.PaypalClientID, ClientSecret: cfg.PaypalClientSecret, Environment: cfg.PaypalEnvironment},
+		PayPal: newPayPalService(cfg),
 	}
 	v1.Get("/events/public", eventH.ListPublic)
 	v1.Get("/events/:id", eventH.GetByID)
@@ -124,15 +124,12 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 			APIKey:      cfg.WipayAPIKey,
 			Environment: cfg.WipayEnvironment,
 		},
-		PayPal: &services.PayPalService{
-			ClientID:     cfg.PaypalClientID,
-			ClientSecret: cfg.PaypalClientSecret,
-			Environment:  cfg.PaypalEnvironment,
-		},
+		PayPal: newPayPalService(cfg),
 	}
 	v1.Get("/connect/status", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutAuth, payoutH.Status)
 	v1.Post("/connect/wipay", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutAuth, payoutH.ConnectWiPay)
 	v1.Post("/connect/paypal", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutAuth, payoutH.ConnectPayPal)
+	v1.Get("/connect/paypal/complete", payoutH.CompletePayPal)
 	v1.Post("/connect/activate", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutAuth, payoutH.Activate)
 	v1.Post("/connect/deactivate", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutAuth, payoutH.Deactivate)
 	v1.Get("/connect/balance", middleware.Protected(cfg.JWTSecret), middleware.RequireRole("host"), payoutAuth, payoutH.Balance)
@@ -141,7 +138,7 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	// Tickets
 	ticketH := &handlers.TicketHandler{
 		DB: db, Cfg: cfg, Email: emailSvc,
-		PayPal: &services.PayPalService{ClientID: cfg.PaypalClientID, ClientSecret: cfg.PaypalClientSecret, Environment: cfg.PaypalEnvironment},
+		PayPal: newPayPalService(cfg),
 	}
 	v1.Get("/tickets/lookup", ticketH.Lookup)
 	v1.Get("/tickets/enter", ticketH.Enter)
@@ -170,4 +167,11 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 		return fiber.ErrUpgradeRequired
 	})
 	v1.Get("/events/:id/chat/ws", websocket.New(chatH.HandleWS))
+}
+
+func newPayPalService(cfg *config.Config) *services.PayPalService {
+	return &services.PayPalService{
+		ClientID: cfg.PaypalClientID, ClientSecret: cfg.PaypalClientSecret, Environment: cfg.PaypalEnvironment,
+		PartnerMerchantID: cfg.PaypalPartnerMerchantID, PartnerAttributionID: cfg.PaypalPartnerAttributionID,
+	}
 }

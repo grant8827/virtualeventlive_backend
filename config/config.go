@@ -41,9 +41,11 @@ type Config struct {
 	WipayEnvironment   string
 
 	// PayPal — Payouts API (https://developer.paypal.com/docs/payouts/).
-	PaypalClientID     string
-	PaypalClientSecret string
-	PaypalEnvironment  string
+	PaypalClientID             string
+	PaypalClientSecret         string
+	PaypalEnvironment          string
+	PaypalPartnerMerchantID    string
+	PaypalPartnerAttributionID string
 }
 
 func Load() *Config {
@@ -76,9 +78,11 @@ func Load() *Config {
 		WipayAPIKey:        getEnv("WIPAY_API_KEY", ""),
 		WipayEnvironment:   getEnv("WIPAY_ENVIRONMENT", "sandbox"),
 
-		PaypalClientID:     getEnv("PAYPAL_CLIENT_ID", ""),
-		PaypalClientSecret: getEnv("PAYPAL_CLIENT_SECRET", ""),
-		PaypalEnvironment:  getEnv("PAYPAL_ENVIRONMENT", "sandbox"),
+		PaypalClientID:             getEnv("PAYPAL_CLIENT_ID", ""),
+		PaypalClientSecret:         getEnv("PAYPAL_CLIENT_SECRET", ""),
+		PaypalEnvironment:          getEnv("PAYPAL_ENVIRONMENT", "sandbox"),
+		PaypalPartnerMerchantID:    getEnv("PAYPAL_PARTNER_MERCHANT_ID", ""),
+		PaypalPartnerAttributionID: getEnv("PAYPAL_PARTNER_ATTRIBUTION_ID", ""),
 	}
 }
 
