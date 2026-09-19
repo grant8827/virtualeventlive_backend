@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -540,58 +541,124 @@ func (h *TicketHandler) PayPalComplete(c *fiber.Ctx) error {
 	if orderID == "" || h.PayPal == nil {
 		return c.Redirect(redirect + "?payment=failed")
 	}
-	tx, err := h.DB.Begin(context.Background())
-	if err != nil {
-		return c.Redirect(redirect + "?payment=failed")
+	buyerEmail, _, err := h.completePayPalTicketOrder(context.Background(), orderID)
+	if buyerEmail != "" {
+		redirect += "?email=" + url.QueryEscape(buyerEmail)
 	}
-	defer tx.Rollback(context.Background())
-	var eventID, buyerEmail, status, merchantID string
+	if err != nil {
+		fmt.Printf("paypal ticket completion error: %v\n", err)
+		separator := "?"
+		if strings.Contains(redirect, "?") {
+			separator = "&"
+		}
+		return c.Redirect(redirect + separator + "payment=failed")
+	}
+	return c.Redirect(redirect)
+}
+
+// PayPalWebhook is the fallback for buyers who approve payment and close the
+// PayPal window before the browser return reaches PayPalComplete. PayPal signs
+// the event, and its verification API validates that signature before we act.
+func (h *TicketHandler) PayPalWebhook(c *fiber.Ctx) error {
+	if h.PayPal == nil {
+		return c.SendStatus(fiber.StatusServiceUnavailable)
+	}
+	raw := append([]byte(nil), c.Body()...)
+	var event struct {
+		ID           string          `json:"id"`
+		EventType    string          `json:"event_type"`
+		Resource     json.RawMessage `json:"resource"`
+		ResourceType string          `json:"resource_type"`
+	}
+	if err := json.Unmarshal(raw, &event); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid PayPal webhook"})
+	}
+	verified, err := h.PayPal.VerifyWebhookSignature(
+		c.Get("PayPal-Transmission-Id"),
+		c.Get("PayPal-Transmission-Time"),
+		c.Get("PayPal-Cert-Url"),
+		c.Get("PayPal-Auth-Algo"),
+		c.Get("PayPal-Transmission-Sig"),
+		json.RawMessage(raw),
+	)
+	if err != nil {
+		fmt.Printf("paypal webhook verification error: %v\n", err)
+		return c.SendStatus(fiber.StatusBadGateway)
+	}
+	if !verified {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid PayPal webhook signature"})
+	}
+
+	if event.EventType == "CHECKOUT.ORDER.APPROVED" {
+		var resource struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(event.Resource, &resource); err != nil || resource.ID == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "PayPal order ID is missing"})
+		}
+		if _, _, err := h.completePayPalTicketOrder(context.Background(), resource.ID); err != nil {
+			fmt.Printf("paypal webhook order completion error: event=%s order=%s error=%v\n", event.ID, resource.ID, err)
+			// A non-2xx response asks PayPal to retry a transient failure.
+			return c.SendStatus(fiber.StatusInternalServerError)
+		}
+	}
+	return c.SendStatus(fiber.StatusOK)
+}
+
+// completePayPalTicketOrder captures and fulfils one locally-created PayPal
+// order. The row lock makes browser returns and webhook retries converge on
+// exactly one ticket and ledger entry.
+func (h *TicketHandler) completePayPalTicketOrder(ctx context.Context, orderID string) (buyerEmail string, alreadyCompleted bool, resultErr error) {
+	tx, err := h.DB.Begin(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	defer tx.Rollback(ctx)
+	var eventID, status, merchantID string
 	var buyerID *string
 	var amount float64
-	if err := tx.QueryRow(context.Background(),
+	if err := tx.QueryRow(ctx,
 		`SELECT event_id, buyer_id, buyer_email, amount, status, merchant_id
 		 FROM paypal_ticket_orders WHERE order_id = $1 FOR UPDATE`, orderID,
 	).Scan(&eventID, &buyerID, &buyerEmail, &amount, &status, &merchantID); err != nil {
-		return c.Redirect(redirect + "?payment=failed")
+		return "", false, err
 	}
-	redirect += "?email=" + url.QueryEscape(buyerEmail)
 	if status == "completed" {
-		return c.Redirect(redirect)
+		return buyerEmail, true, nil
 	}
 	if err := h.PayPal.CaptureCheckoutOrder(orderID, merchantID); err != nil {
-		fmt.Printf("paypal ticket capture error: %v\n", err)
-		return c.Redirect(redirect + "&payment=failed")
+		return buyerEmail, false, err
 	}
 
 	var ticketID, accessToken string
 	accessToken = services.GenerateTicketCode()
 	if buyerID != nil {
-		err = tx.QueryRow(context.Background(), `INSERT INTO tickets (event_id,buyer_id,access_token) VALUES ($1,$2,$3) RETURNING id`, eventID, *buyerID, accessToken).Scan(&ticketID)
+		err = tx.QueryRow(ctx, `INSERT INTO tickets (event_id,buyer_id,access_token) VALUES ($1,$2,$3) RETURNING id`, eventID, *buyerID, accessToken).Scan(&ticketID)
 	} else {
-		err = tx.QueryRow(context.Background(), `INSERT INTO tickets (event_id,buyer_id,guest_email,access_token) VALUES ($1,NULL,$2,$3) RETURNING id`, eventID, buyerEmail, accessToken).Scan(&ticketID)
+		err = tx.QueryRow(ctx, `INSERT INTO tickets (event_id,buyer_id,guest_email,access_token) VALUES ($1,NULL,$2,$3) RETURNING id`, eventID, buyerEmail, accessToken).Scan(&ticketID)
 	}
 	if err != nil {
-		return c.Redirect(redirect + "&payment=failed")
+		return buyerEmail, false, err
 	}
 	split := services.CalculateSplit(amount)
-	if _, err = tx.Exec(context.Background(),
+	if _, err = tx.Exec(ctx,
 		`INSERT INTO ledger_entries (ticket_id,event_id,gross_amount,stripe_fee,platform_fee,host_payout,payout_gateway,payout_status)
 		 VALUES ($1,$2,$3,0,$4,$5,'paypal','paid')`, ticketID, eventID, amount, split.PlatformFee, split.HostShare()); err != nil {
-		return c.Redirect(redirect + "&payment=failed")
+		return buyerEmail, false, err
 	}
-	if _, err = tx.Exec(context.Background(), `UPDATE paypal_ticket_orders SET status='completed', ticket_id=$2, completed_at=NOW() WHERE order_id=$1 AND status='created'`, orderID, ticketID); err != nil {
-		return c.Redirect(redirect + "&payment=failed")
+	if _, err = tx.Exec(ctx, `UPDATE paypal_ticket_orders SET status='completed', ticket_id=$2, completed_at=NOW() WHERE order_id=$1 AND status='created'`, orderID, ticketID); err != nil {
+		return buyerEmail, false, err
 	}
-	if err = tx.Commit(context.Background()); err != nil {
-		return c.Redirect(redirect + "&payment=failed")
+	if err = tx.Commit(ctx); err != nil {
+		return buyerEmail, false, err
 	}
 	var eventTitle string
 	var startsAt time.Time
-	_ = h.DB.QueryRow(context.Background(), `SELECT title,start_time FROM events WHERE id=$1`, eventID).Scan(&eventTitle, &startsAt)
+	_ = h.DB.QueryRow(ctx, `SELECT title,start_time FROM events WHERE id=$1`, eventID).Scan(&eventTitle, &startsAt)
 	if h.Email != nil {
 		_ = h.Email.SendTicketConfirmation(buyerEmail, eventTitle, accessToken, startsAt)
 	}
-	return c.Redirect(redirect)
+	return buyerEmail, false, nil
 }
 
 // stripeCheckoutError preserves Stripe's actionable, non-sensitive error

@@ -209,9 +209,8 @@ func (h *PayoutHandler) Balance(c *fiber.Ctx) error {
 	})
 }
 
-// Payout sends the host's pending balance through their active non-Stripe
-// gateway. Stripe hosts are paid automatically at checkout via destination
-// charges, so there's nothing to trigger here.
+// Payout sends a pending balance through a manual payout rail. Stripe and
+// PayPal Commerce Platform hosts are paid automatically during checkout.
 func (h *PayoutHandler) Payout(c *fiber.Ctx) error {
 	hostID, ok := c.Locals("user_id").(string)
 	if !ok || hostID == "" {
@@ -231,15 +230,18 @@ func (h *PayoutHandler) Payout(c *fiber.Ctx) error {
 	}
 
 	var gateway string
-	var wipayAccountID, paypalAccountID *string
+	var wipayAccountID *string
 	err = tx.QueryRow(ctx,
-		`SELECT payout_gateway, wipay_account_id, paypal_account_id FROM connected_accounts WHERE user_id = $1`, hostID,
-	).Scan(&gateway, &wipayAccountID, &paypalAccountID)
+		`SELECT payout_gateway, wipay_account_id FROM connected_accounts WHERE user_id = $1`, hostID,
+	).Scan(&gateway, &wipayAccountID)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "no payout account connected"})
 	}
 	if gateway == "stripe" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Stripe payouts happen automatically — nothing to trigger"})
+	}
+	if gateway == "paypal" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "PayPal splits and disburses ticket revenue automatically — nothing to trigger"})
 	}
 
 	var pending float64
@@ -263,15 +265,6 @@ func (h *PayoutHandler) Payout(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "no WiPay account connected"})
 		}
 		ref, err := h.WiPay.SendPayout(*wipayAccountID, pending, "")
-		if err != nil {
-			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": err.Error()})
-		}
-		transactionRef = ref
-	case "paypal":
-		if paypalAccountID == nil || h.PayPal == nil || !h.PayPal.Enabled() {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "no PayPal account connected"})
-		}
-		ref, err := h.PayPal.SendPayout(*paypalAccountID, pending, "Virtual Event Plus ticket revenue")
 		if err != nil {
 			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": err.Error()})
 		}

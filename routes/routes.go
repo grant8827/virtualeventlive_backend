@@ -140,6 +140,7 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 		DB: db, Cfg: cfg, Email: emailSvc,
 		PayPal: newPayPalService(cfg),
 	}
+	app.Post("/api/v1/webhooks/paypal", ticketH.PayPalWebhook)
 	v1.Get("/tickets/lookup", ticketH.Lookup)
 	v1.Get("/tickets/enter", ticketH.Enter)
 	v1.Post("/tickets/guest-purchase", ticketH.GuestPurchase)
@@ -173,5 +174,6 @@ func newPayPalService(cfg *config.Config) *services.PayPalService {
 	return &services.PayPalService{
 		ClientID: cfg.PaypalClientID, ClientSecret: cfg.PaypalClientSecret, Environment: cfg.PaypalEnvironment,
 		PartnerMerchantID: cfg.PaypalPartnerMerchantID, PartnerAttributionID: cfg.PaypalPartnerAttributionID,
+		WebhookID: cfg.PaypalWebhookID,
 	}
 }

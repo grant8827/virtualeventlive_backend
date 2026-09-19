@@ -40,12 +40,13 @@ type Config struct {
 	WipayAPIKey        string
 	WipayEnvironment   string
 
-	// PayPal — Payouts API (https://developer.paypal.com/docs/payouts/).
+	// PayPal Commerce Platform multiparty checkout.
 	PaypalClientID             string
 	PaypalClientSecret         string
 	PaypalEnvironment          string
 	PaypalPartnerMerchantID    string
 	PaypalPartnerAttributionID string
+	PaypalWebhookID            string
 }
 
 func Load() *Config {
@@ -83,6 +84,7 @@ func Load() *Config {
 		PaypalEnvironment:          getEnv("PAYPAL_ENVIRONMENT", "sandbox"),
 		PaypalPartnerMerchantID:    getEnv("PAYPAL_PARTNER_MERCHANT_ID", ""),
 		PaypalPartnerAttributionID: getEnv("PAYPAL_PARTNER_ATTRIBUTION_ID", ""),
+		PaypalWebhookID:            getEnv("PAYPAL_WEBHOOK_ID", ""),
 	}
 }
 

@@ -8,17 +8,63 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"time"
 )
 
-// PayPalService sends host payouts via PayPal's Payouts API:
-// https://developer.paypal.com/docs/payouts/standard/
+// PayPalService implements PayPal Checkout and Commerce Platform multiparty
+// seller onboarding. Host ticket revenue is split at capture time.
 type PayPalService struct {
 	ClientID             string
 	ClientSecret         string
 	Environment          string // "sandbox" or "live"
 	PartnerMerchantID    string
 	PartnerAttributionID string
+	WebhookID            string
+}
+
+// VerifyWebhookSignature asks PayPal to validate the signed transmission.
+// Webhook bodies must never be acted on before this returns true.
+func (p *PayPalService) VerifyWebhookSignature(transmissionID, transmissionTime, certURL, authAlgo, transmissionSig string, event json.RawMessage) (bool, error) {
+	if !p.PartnerEnabled() || p.WebhookID == "" {
+		return false, fmt.Errorf("paypal webhook verification not configured")
+	}
+	token, err := p.accessToken()
+	if err != nil {
+		return false, err
+	}
+	body := map[string]any{
+		"transmission_id":   transmissionID,
+		"transmission_time": transmissionTime,
+		"cert_url":          certURL,
+		"auth_algo":         authAlgo,
+		"transmission_sig":  transmissionSig,
+		"webhook_id":        p.WebhookID,
+		"webhook_event":     event,
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return false, err
+	}
+	req, err := http.NewRequest(http.MethodPost, p.baseURL()+"/v1/notifications/verify-webhook-signature", bytes.NewReader(payload))
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("paypal webhook verification request: %w", err)
+	}
+	defer resp.Body.Close()
+	var out struct {
+		VerificationStatus string `json:"verification_status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return false, fmt.Errorf("paypal webhook verification decode: %w", err)
+	}
+	if resp.StatusCode >= 300 {
+		return false, fmt.Errorf("paypal webhook verification failed (status %d)", resp.StatusCode)
+	}
+	return out.VerificationStatus == "SUCCESS", nil
 }
 
 // CheckoutOrderRequest describes a one-time PayPal Checkout payment.
@@ -283,68 +329,4 @@ func (p *PayPalService) CaptureCheckoutOrder(orderID string, merchantID ...strin
 		return fmt.Errorf("paypal capture failed: %s %s (status %d)", out.Name, out.Message, resp.StatusCode)
 	}
 	return nil
-}
-
-// SendPayout pays receiverEmail amountUSD via a single-item PayPal payout batch
-// and returns the batch ID for reconciliation.
-func (p *PayPalService) SendPayout(receiverEmail string, amountUSD float64, note string) (string, error) {
-	if !p.Enabled() {
-		return "", fmt.Errorf("paypal not configured")
-	}
-
-	token, err := p.accessToken()
-	if err != nil {
-		return "", err
-	}
-
-	body := map[string]any{
-		"sender_batch_header": map[string]any{
-			"sender_batch_id": fmt.Sprintf("vel-%d", time.Now().UnixNano()),
-			"email_subject":   "You have a payout from Virtual Event Plus",
-		},
-		"items": []map[string]any{
-			{
-				"recipient_type": "EMAIL",
-				"receiver":       receiverEmail,
-				"note":           note,
-				"amount": map[string]string{
-					"value":    strconv.FormatFloat(amountUSD, 'f', 2, 64),
-					"currency": "USD",
-				},
-			},
-		},
-	}
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return "", err
-	}
-
-	req, err := http.NewRequest(http.MethodPost, p.baseURL()+"/v1/payments/payouts", bytes.NewReader(payload))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("paypal payout request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	var out struct {
-		BatchHeader struct {
-			PayoutBatchID string `json:"payout_batch_id"`
-		} `json:"batch_header"`
-		Name    string `json:"name"`
-		Message string `json:"message"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", fmt.Errorf("paypal payout decode: %w", err)
-	}
-	if resp.StatusCode >= 300 {
-		return "", fmt.Errorf("paypal payout failed: %s %s (status %d)", out.Name, out.Message, resp.StatusCode)
-	}
-
-	return out.BatchHeader.PayoutBatchID, nil
 }
