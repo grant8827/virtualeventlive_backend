@@ -15,6 +15,7 @@ import (
 	"github.com/stripe/stripe-go/v82/checkout/session"
 
 	"vertualeventlive/backend/config"
+	"vertualeventlive/backend/middleware"
 	"vertualeventlive/backend/services"
 )
 
@@ -230,23 +231,27 @@ func (h *TicketHandler) CheckIn(c *fiber.Ctx) error {
 		serialNo         int64
 		eventTitle       string
 		eventHostID      string
+		eventAssignedTo  *string
 		ticketType       string
 		checkedInAt      *time.Time
 		checkedInChannel *string
 	)
 	err := h.DB.QueryRow(context.Background(),
-		`SELECT t.id, t.serial_no, e.title, e.host_id, e.ticket_type, t.checked_in_at, t.checked_in_channel
+		`SELECT t.id, t.serial_no, e.title, e.host_id, e.assigned_to, e.ticket_type, t.checked_in_at, t.checked_in_channel
 		 FROM tickets t
 		 JOIN events e ON e.id = t.event_id
 		 WHERE t.serial_no::text = $1 OR t.access_token = $1`,
 		code,
-	).Scan(&ticketID, &serialNo, &eventTitle, &eventHostID, &ticketType, &checkedInAt, &checkedInChannel)
+	).Scan(&ticketID, &serialNo, &eventTitle, &eventHostID, &eventAssignedTo, &ticketType, &checkedInAt, &checkedInChannel)
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Ticket not found."})
 	}
 
 	if eventHostID != hostID {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "This ticket belongs to a different host's event."})
+	}
+	if staffID, isStaff := middleware.AssignedStaff(c); isStaff && (eventAssignedTo == nil || *eventAssignedTo != staffID) {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "This ticket is for an event that isn't assigned to you."})
 	}
 	if ticketType != "Virtual + Location" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "This is a virtual-only ticket — it doesn't need a door check-in."})

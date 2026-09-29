@@ -11,14 +11,19 @@ import (
 
 	"vertualeventlive/backend/config"
 	"vertualeventlive/backend/middleware"
+	"vertualeventlive/backend/services"
 )
 
 type AuthHandler struct {
-	DB  *pgxpool.Pool
-	Cfg *config.Config
+	DB    *pgxpool.Pool
+	Cfg   *config.Config
+	Email *services.EmailService
 }
 
 type registerRequest struct {
+	// Registration is invite-only: the token from the invite link decides
+	// the account's email address.
+	InviteToken      string `json:"invite_token"`
 	Email            string `json:"email"`
 	Password         string `json:"password"`
 	FullName         string `json:"full_name"`
@@ -42,8 +47,11 @@ func (h *AuthHandler) Register(c *fiber.Ctx) error {
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
 	}
-	if req.Email == "" || req.Password == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "email and password are required"})
+	if req.InviteToken == "" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "registration is by invitation only"})
+	}
+	if len(req.Password) < 8 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "password must be at least 8 characters"})
 	}
 	if req.FullName == "" || req.Phone == "" || req.AddressLine1 == "" || req.City == "" ||
 		req.State == "" || req.PostalCode == "" || req.Country == "" {
@@ -55,24 +63,52 @@ func (h *AuthHandler) Register(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to hash password"})
 	}
 
+	ctx := context.Background()
+	tx, err := h.DB.Begin(ctx)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to create account"})
+	}
+	defer tx.Rollback(ctx)
+
+	// Claim the invitation. FOR UPDATE stops the same link registering twice.
+	var inviteID, email string
+	err = tx.QueryRow(ctx,
+		`SELECT id, email FROM invitations
+		 WHERE token_hash = $1 AND accepted_at IS NULL AND expires_at > NOW()
+		 FOR UPDATE`, hashInvitationToken(req.InviteToken),
+	).Scan(&inviteID, &email)
+	if err != nil {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "this invitation link is invalid, used or expired"})
+	}
+
+	// New hosts wait for a superuser to approve them before they can sign in.
 	var userID string
-	err = h.DB.QueryRow(context.Background(),
+	err = tx.QueryRow(ctx,
 		`INSERT INTO users (
-			email, password_hash, role, full_name, phone,
+			email, password_hash, role, status, full_name, phone,
 			address_line1, address_line2, city, state, postal_code, country, organization_name
-		) VALUES ($1, $2, 'host', $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		) VALUES ($1, $2, 'host', 'pending', $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		RETURNING id`,
-		req.Email, string(hash), req.FullName, req.Phone,
+		email, string(hash), req.FullName, req.Phone,
 		req.AddressLine1, req.AddressLine2, req.City, req.State, req.PostalCode, req.Country, req.OrganizationName,
 	).Scan(&userID)
 	if err != nil {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "email already in use"})
 	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE invitations SET accepted_at = NOW(), user_id = $1 WHERE id = $2`, userID, inviteID,
+	); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to create account"})
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to create account"})
+	}
 
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
-		"id":    userID,
-		"email": req.Email,
-		"role":  "host",
+		"id":     userID,
+		"email":  email,
+		"role":   "host",
+		"status": "pending",
 	})
 }
 
@@ -82,17 +118,23 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
 	}
 
-	var userID, passwordHash, role string
+	var userID, passwordHash, role, status string
 	err := h.DB.QueryRow(context.Background(),
-		`SELECT id, password_hash, role FROM users WHERE email = $1`,
+		`SELECT id, password_hash, role, status FROM users WHERE email = $1`,
 		req.Email,
-	).Scan(&userID, &passwordHash, &role)
+	).Scan(&userID, &passwordHash, &role, &status)
 	if err != nil {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid credentials"})
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password)); err != nil {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid credentials"})
+	}
+	if status == "pending" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "your account is waiting for approval; you'll get an email once it's approved"})
+	}
+	if status != "active" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "this account has been suspended"})
 	}
 
 	claims := &middleware.Claims{
@@ -138,19 +180,23 @@ func (h *AuthHandler) Logout(c *fiber.Ctx) error {
 
 func (h *AuthHandler) Me(c *fiber.Ctx) error {
 	userID := c.Locals("user_id").(string)
-	role := c.Locals("role").(string)
 
+	// Role comes from the database rather than the token so the dashboard
+	// picks up a staff/admin change without the member signing in again.
 	var (
-		email                                                                string
+		email, role, status                                                  string
 		fullName, phone, addressLine1, addressLine2, city, state, postalCode *string
 		country, organizationName                                            *string
 	)
 	err := h.DB.QueryRow(context.Background(),
-		`SELECT email, full_name, phone, address_line1, address_line2, city, state, postal_code, country, organization_name
+		`SELECT email, role, status, full_name, phone, address_line1, address_line2, city, state, postal_code, country, organization_name
 		 FROM users WHERE id = $1`, userID,
-	).Scan(&email, &fullName, &phone, &addressLine1, &addressLine2, &city, &state, &postalCode, &country, &organizationName)
+	).Scan(&email, &role, &status, &fullName, &phone, &addressLine1, &addressLine2, &city, &state, &postalCode, &country, &organizationName)
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "user not found"})
+	}
+	if status != "active" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "account is not active"})
 	}
 
 	return c.JSON(fiber.Map{

@@ -6,7 +6,19 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"vertualeventlive/backend/middleware"
 )
+
+// staffFilter is the signed-in staff member's ID, or nil for the owner and
+// admins. Queries use it as ($n::uuid IS NULL OR e.assigned_to = $n) so staff
+// only touch flyers for events assigned to them.
+func staffFilter(c *fiber.Ctx) *string {
+	if id, ok := middleware.AssignedStaff(c); ok {
+		return &id
+	}
+	return nil
+}
 
 type AdvertisementHandler struct {
 	DB *pgxpool.Pool
@@ -36,8 +48,9 @@ func (h *AdvertisementHandler) Create(c *fiber.Ctx) error {
 
 	var expired bool
 	if err := h.DB.QueryRow(context.Background(),
-		`SELECT ends_at < NOW() FROM events WHERE id = $1 AND host_id = $2`,
-		*req.EventID, hostID,
+		`SELECT ends_at < NOW() FROM events
+		 WHERE id = $1 AND host_id = $2 AND ($3::uuid IS NULL OR assigned_to = $3)`,
+		*req.EventID, hostID, staffFilter(c),
 	).Scan(&expired); err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "event not found"})
 	}
@@ -90,9 +103,10 @@ func (h *AdvertisementHandler) Update(c *fiber.Ctx) error {
 	}
 
 	result, err := h.DB.Exec(context.Background(),
-		`UPDATE advertisements SET headline = $1, body = $2, image_url = $3, cta_text = $4
-		 WHERE id = $5 AND host_id = $6`,
-		req.Headline, req.Body, req.ImageURL, req.CTAText, adID, hostID,
+		`UPDATE advertisements a SET headline = $1, body = $2, image_url = $3, cta_text = $4
+		 WHERE a.id = $5 AND a.host_id = $6
+		   AND ($7::uuid IS NULL OR EXISTS(SELECT 1 FROM events e WHERE e.id = a.event_id AND e.assigned_to = $7))`,
+		req.Headline, req.Body, req.ImageURL, req.CTAText, adID, hostID, staffFilter(c),
 	)
 	if err != nil || result.RowsAffected() == 0 {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "ad not found"})
@@ -156,9 +170,9 @@ func (h *AdvertisementHandler) ListByHost(c *fiber.Ctx) error {
 		        a.event_id, e.title AS event_title, a.is_active, a.created_at, e.ends_at
 		 FROM advertisements a
 		 LEFT JOIN events e ON e.id = a.event_id
-		 WHERE a.host_id = $1
+		 WHERE a.host_id = $1 AND ($2::uuid IS NULL OR e.assigned_to = $2)
 		 ORDER BY a.created_at DESC`,
-		hostID,
+		hostID, staffFilter(c),
 	)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to fetch advertisements"})
@@ -203,8 +217,10 @@ func (h *AdvertisementHandler) Delete(c *fiber.Ctx) error {
 	adID := c.Params("id")
 
 	result, err := h.DB.Exec(context.Background(),
-		`DELETE FROM advertisements WHERE id = $1 AND host_id = $2`,
-		adID, hostID,
+		`DELETE FROM advertisements a
+		 WHERE a.id = $1 AND a.host_id = $2
+		   AND ($3::uuid IS NULL OR EXISTS(SELECT 1 FROM events e WHERE e.id = a.event_id AND e.assigned_to = $3))`,
+		adID, hostID, staffFilter(c),
 	)
 	if err != nil || result.RowsAffected() == 0 {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "ad not found"})

@@ -18,6 +18,7 @@ import (
 	"github.com/stripe/stripe-go/v82/checkout/session"
 
 	"vertualeventlive/backend/config"
+	"vertualeventlive/backend/middleware"
 	"vertualeventlive/backend/services"
 )
 
@@ -44,6 +45,9 @@ type createEventRequest struct {
 	Description string    `json:"description"`
 	StartsAt    time.Time `json:"starts_at"`
 	EndsAt      time.Time `json:"ends_at"`
+	// Optional team member responsible for the event. Staff only see
+	// events assigned to them.
+	AssignedTo string `json:"assigned_to"`
 }
 
 func (h *EventHandler) Create(c *fiber.Ctx) error {
@@ -72,16 +76,27 @@ func (h *EventHandler) Create(c *fiber.Ctx) error {
 		req.EventType = "other"
 	}
 
+	assignedTo := nullIfEmpty(req.AssignedTo)
+	if assignedTo != nil {
+		var onTeam bool
+		if err := h.DB.QueryRow(context.Background(),
+			`SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND account_owner_id = $2 AND status = 'active')`,
+			*assignedTo, hostID,
+		).Scan(&onTeam); err != nil || !onTeam {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "assigned user is not an active member of this account"})
+		}
+	}
+
 	hours := int(math.Ceil(duration.Hours()))
 	venueFee := float64(hours) * h.Cfg.HourlyRate
 
 	var eventID string
 	err := h.DB.QueryRow(context.Background(),
 		`INSERT INTO events
-			(host_id, title, event_type, description, start_time, ends_at, ticket_price, venue_fee, is_active, package_type)
-		 VALUES ($1,$2,$3,$4,$5,$6,0,$7,false,'revenue_share')
+			(host_id, title, event_type, description, start_time, ends_at, ticket_price, venue_fee, is_active, package_type, assigned_to)
+		 VALUES ($1,$2,$3,$4,$5,$6,0,$7,false,'revenue_share',$8)
 		 RETURNING id`,
-		hostID, req.Title, req.EventType, req.Description, req.StartsAt, req.EndsAt, venueFee,
+		hostID, req.Title, req.EventType, req.Description, req.StartsAt, req.EndsAt, venueFee, assignedTo,
 	).Scan(&eventID)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to create event"})
@@ -97,6 +112,7 @@ func (h *EventHandler) Create(c *fiber.Ctx) error {
 		"venue_fee":   venueFee,
 		"hours":       hours,
 		"venue_paid":  false,
+		"assigned_to": assignedTo,
 	})
 }
 
@@ -166,10 +182,11 @@ func (h *EventHandler) Checkout(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"checkout_provider": "paypal", "checkout_url": order.ApprovalURL})
 	}
 
-	// No payment provider configured — bypass payment and mark event as paid directly
+	// No payment provider configured — bypass payment and mark event as paid
+	// directly. Flagged as bypassed so it isn't counted as venue-fee revenue.
 	if h.Cfg.StripeSecretKey == "" {
 		if _, err := h.DB.Exec(context.Background(),
-			`UPDATE events SET venue_paid = true, is_active = true WHERE id = $1`, eventID,
+			`UPDATE events SET venue_paid = true, is_active = true, venue_bypassed = true WHERE id = $1`, eventID,
 		); err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to activate event"})
 		}
@@ -454,16 +471,20 @@ func (h *EventHandler) TicketSetup(c *fiber.Ctx) error {
 }
 
 // BypassActivate marks an event as paid and active without going through
-// Stripe. Dev/testing use only — activate from the frontend bypass button.
+// Stripe. Dev/testing use only: it is refused unless ALLOW_PAYMENT_BYPASS is
+// on. Superusers activate events from the platform dashboard instead.
 func (h *EventHandler) BypassActivate(c *fiber.Ctx) error {
 	hostID, ok := c.Locals("user_id").(string)
 	if !ok || hostID == "" {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
 	}
+	if !h.Cfg.AllowPaymentBypass {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "payment bypass is disabled"})
+	}
 	eventID := c.Params("id")
 
 	result, err := h.DB.Exec(context.Background(),
-		`UPDATE events SET venue_paid = true, is_active = true
+		`UPDATE events SET venue_paid = true, is_active = true, venue_bypassed = true
 		 WHERE id = $1 AND host_id = $2`,
 		eventID, hostID,
 	)
@@ -536,18 +557,26 @@ func (h *EventHandler) ListByHost(c *fiber.Ctx) error {
 		orderBy = "e.ends_at DESC"
 	}
 
+	// Staff only list events assigned to them; nil shows every event.
+	var staffID *string
+	if id, ok := middleware.AssignedStaff(c); ok {
+		staffID = &id
+	}
+
 	rows, err := h.DB.Query(context.Background(),
 		`SELECT e.id, e.title, e.event_type, e.start_time, e.ends_at, e.ticket_name,
 		        e.ticket_price, e.ticket_type, e.max_tickets,
 		        e.card_bg_from, e.card_bg_to, e.card_bg_image, e.logo_image, e.venue_address,
 		        e.venue_fee, e.venue_paid, e.is_active, (e.ends_at < NOW()) AS expired,
-		        e.created_at, COUNT(t.id) AS ticket_count
+		        e.created_at, COUNT(t.id) AS ticket_count,
+		        e.assigned_to, COALESCE(u.full_name, u.email) AS assigned_to_name
 		 FROM events e
 		 LEFT JOIN tickets t ON t.event_id = e.id
-		 WHERE e.host_id = $1 AND `+dateFilter+`
-		 GROUP BY e.id
+		 LEFT JOIN users u ON u.id = e.assigned_to
+		 WHERE e.host_id = $1 AND ($2::uuid IS NULL OR e.assigned_to = $2) AND `+dateFilter+`
+		 GROUP BY e.id, u.id
 		 ORDER BY `+orderBy,
-		hostID,
+		hostID, staffID,
 	)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to fetch events"})
@@ -555,26 +584,28 @@ func (h *EventHandler) ListByHost(c *fiber.Ctx) error {
 	defer rows.Close()
 
 	type eventRow struct {
-		ID           string     `json:"id"`
-		Title        string     `json:"title"`
-		EventType    string     `json:"event_type"`
-		StartsAt     time.Time  `json:"starts_at"`
-		EndsAt       *time.Time `json:"ends_at"`
-		TicketName   string     `json:"ticket_name"`
-		TicketPrice  float64    `json:"ticket_price"`
-		TicketType   string     `json:"ticket_type"`
-		MaxTickets   *int       `json:"max_tickets"`
-		CardBgFrom   string     `json:"card_bg_from"`
-		CardBgTo     string     `json:"card_bg_to"`
-		CardBgImage  *string    `json:"card_bg_image"`
-		LogoImage    *string    `json:"logo_image"`
-		VenueAddress *string    `json:"venue_address"`
-		VenueFee     float64    `json:"venue_fee"`
-		VenuePaid    bool       `json:"venue_paid"`
-		IsActive     bool       `json:"is_active"`
-		Expired      bool       `json:"expired"`
-		CreatedAt    time.Time  `json:"created_at"`
-		TicketCount  int        `json:"ticket_count"`
+		ID             string     `json:"id"`
+		Title          string     `json:"title"`
+		EventType      string     `json:"event_type"`
+		StartsAt       time.Time  `json:"starts_at"`
+		EndsAt         *time.Time `json:"ends_at"`
+		TicketName     string     `json:"ticket_name"`
+		TicketPrice    float64    `json:"ticket_price"`
+		TicketType     string     `json:"ticket_type"`
+		MaxTickets     *int       `json:"max_tickets"`
+		CardBgFrom     string     `json:"card_bg_from"`
+		CardBgTo       string     `json:"card_bg_to"`
+		CardBgImage    *string    `json:"card_bg_image"`
+		LogoImage      *string    `json:"logo_image"`
+		VenueAddress   *string    `json:"venue_address"`
+		VenueFee       float64    `json:"venue_fee"`
+		VenuePaid      bool       `json:"venue_paid"`
+		IsActive       bool       `json:"is_active"`
+		Expired        bool       `json:"expired"`
+		CreatedAt      time.Time  `json:"created_at"`
+		TicketCount    int        `json:"ticket_count"`
+		AssignedTo     *string    `json:"assigned_to"`
+		AssignedToName *string    `json:"assigned_to_name"`
 	}
 
 	events := []eventRow{}
@@ -586,6 +617,7 @@ func (h *EventHandler) ListByHost(c *fiber.Ctx) error {
 			&e.CardBgFrom, &e.CardBgTo, &e.CardBgImage, &e.LogoImage, &e.VenueAddress,
 			&e.VenueFee, &e.VenuePaid, &e.IsActive, &e.Expired,
 			&e.CreatedAt, &e.TicketCount,
+			&e.AssignedTo, &e.AssignedToName,
 		); err != nil {
 			continue
 		}

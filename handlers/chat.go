@@ -327,8 +327,8 @@ func (h *ChatHandler) Register(c *fiber.Ctx) error {
 // ─── WebSocket ──────────────────────────────────────────────────────────────
 
 // authenticateHost checks a JWT (passed as ?token=) belongs to the actual
-// host of this event — anyone else, including other hosts, connects as a
-// regular viewer.
+// host of this event, or a member of their team — anyone else, including
+// other hosts, connects as a regular viewer.
 func (h *ChatHandler) authenticateHost(eventID, token string) bool {
 	if token == "" {
 		return false
@@ -337,17 +337,33 @@ func (h *ChatHandler) authenticateHost(eventID, token string) bool {
 	parsed, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (interface{}, error) {
 		return []byte(h.Cfg.JWTSecret), nil
 	})
-	if err != nil || !parsed.Valid || claims.Role != "host" {
+	if err != nil || !parsed.Valid {
 		return false
 	}
 
-	var hostID string
-	if err := h.DB.QueryRow(context.Background(),
-		`SELECT host_id FROM events WHERE id = $1`, eventID,
-	).Scan(&hostID); err != nil {
+	// Staff and admins on the host's team moderate as the host.
+	acct, err := middleware.ResolveAccount(context.Background(), h.DB, claims.UserID)
+	if err != nil || !acct.Active || acct.TeamRole == "" {
 		return false
 	}
-	return hostID == claims.UserID
+
+	var (
+		hostID     string
+		assignedTo *string
+	)
+	if err := h.DB.QueryRow(context.Background(),
+		`SELECT host_id, assigned_to FROM events WHERE id = $1`, eventID,
+	).Scan(&hostID, &assignedTo); err != nil {
+		return false
+	}
+	if hostID != acct.OwnerID {
+		return false
+	}
+	// Staff only moderate events assigned to them.
+	if acct.TeamRole == middleware.TeamStaff {
+		return assignedTo != nil && *assignedTo == claims.UserID
+	}
+	return true
 }
 
 // authenticateChat validates a ?chat_token= issued by Register for this

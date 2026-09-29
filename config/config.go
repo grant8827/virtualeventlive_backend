@@ -21,12 +21,21 @@ type Config struct {
 	StripeWebhookSecret string
 	ResendAPIKey        string
 	FromEmail           string
-	HourlyRate          float64
-	AWSAccessKeyID      string
-	AWSSecretAccessKey  string
-	AWSRegion           string
-	S3BucketName        string
-	S3Region            string
+	// SMTP (e.g. Mailtrap). When SMTPHost is set, email goes out over SMTP
+	// instead of the Resend API.
+	SMTPHost     string
+	SMTPPort     string
+	SMTPUsername string
+	SMTPPassword string
+	HourlyRate   float64
+	// AllowPaymentBypass enables the "Bypass Payment & Activate" testing
+	// button for hosts. Leave off in production.
+	AllowPaymentBypass bool
+	AWSAccessKeyID     string
+	AWSSecretAccessKey string
+	AWSRegion          string
+	S3BucketName       string
+	S3Region           string
 
 	// WiPay — Caribbean payout rail. Host payouts are sent to WipayAccountNumber
 	// via WipayAPIBaseURL once WiPay confirms their disbursement endpoint contract;
@@ -63,7 +72,12 @@ func Load() *Config {
 		StripeWebhookSecret: getEnv("STRIPE_WEBHOOK_SECRET", ""),
 		ResendAPIKey:        getEnv("RESEND_API_KEY", ""),
 		FromEmail:           getEnv("FROM_EMAIL", "tickets@vertualeventlive.com"),
+		SMTPHost:            getEnv("SMTP_HOST", ""),
+		SMTPPort:            getEnv("SMTP_PORT", "587"),
+		SMTPUsername:        getEnv("SMTP_USERNAME", ""),
+		SMTPPassword:        getEnv("SMTP_PASSWORD", ""),
 		HourlyRate:          getFloat("HOURLY_RATE", 20.0),
+		AllowPaymentBypass:  getEnv("ALLOW_PAYMENT_BYPASS", "false") == "true",
 		AWSAccessKeyID:      getEnv("AWS_ACCESS_KEY_ID", ""),
 		AWSSecretAccessKey:  getEnv("AWS_SECRET_ACCESS_KEY", ""),
 		AWSRegion:           getEnv("AWS_REGION", "us-east-1"),

@@ -142,3 +142,28 @@ func (h *StreamCredentialsHandler) Status(c *fiber.Ctx) error {
 
 	return c.JSON(fiber.Map{"live": live})
 }
+
+// Viewers powers the live viewer count on the dashboard's Go Live page.
+// Host/team only — unlike Status, it is scoped to the signed-in account.
+func (h *StreamCredentialsHandler) Viewers(c *fiber.Ctx) error {
+	hostID, ok := c.Locals("user_id").(string)
+	if !ok || hostID == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+
+	var channelARN *string
+	if err := h.DB.QueryRow(context.Background(),
+		`SELECT aws_channel_arn FROM events WHERE id = $1 AND host_id = $2`, c.Params("id"), hostID,
+	).Scan(&channelARN); err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "event not found"})
+	}
+	if channelARN == nil || *channelARN == "" {
+		return c.JSON(fiber.Map{"live": false, "viewer_count": 0})
+	}
+
+	live, viewers, err := h.IVS.StreamState(context.Background(), *channelARN)
+	if err != nil {
+		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "could not reach the streaming service"})
+	}
+	return c.JSON(fiber.Map{"live": live, "viewer_count": viewers})
+}
