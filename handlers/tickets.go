@@ -390,7 +390,7 @@ func (h *TicketHandler) GuestPurchase(c *fiber.Ctx) error {
 			},
 		},
 		CustomerEmail: stripe.String(req.Email),
-		SuccessURL:    stripe.String(h.Cfg.FrontendURL + "/ticket-success?email=" + req.Email),
+		SuccessURL:    stripe.String(h.Cfg.FrontendURL + "/ticket-success?email=" + url.QueryEscape(req.Email)),
 		CancelURL:     stripe.String(h.Cfg.FrontendURL + "/events/" + req.EventID),
 		Metadata: map[string]string{
 			"type":        "ticket",
@@ -494,7 +494,7 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 			},
 		},
 		CustomerEmail: stripe.String(buyerEmail),
-		SuccessURL:    stripe.String(h.Cfg.FrontendURL + "/ticket-success?email=" + buyerEmail),
+		SuccessURL:    stripe.String(h.Cfg.FrontendURL + "/ticket-success?email=" + url.QueryEscape(buyerEmail)),
 		CancelURL:     stripe.String(h.Cfg.FrontendURL + "/events/" + req.EventID),
 		Metadata: map[string]string{
 			"type":     "ticket",

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	stripe "github.com/stripe/stripe-go/v82"
 	"github.com/stripe/stripe-go/v82/accountlink"
@@ -29,6 +30,9 @@ func (h *StripeHandler) ConnectOnboard(c *fiber.Ctx) error {
 	hostID, ok := c.Locals("user_id").(string)
 	if !ok || hostID == "" {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+	if h.Cfg.StripeSecretKey == "" {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Stripe payment processing is not configured"})
 	}
 
 	stripe.Key = h.Cfg.StripeSecretKey
@@ -185,6 +189,9 @@ func (h *StripeHandler) handleVenueFeePaid(sess *stripe.CheckoutSession) error {
 }
 
 func (h *StripeHandler) handleTicketPurchase(sess *stripe.CheckoutSession) error {
+	if !stripeTicketSessionPaid(sess) {
+		return fmt.Errorf("session is not a completed USD ticket payment")
+	}
 	eventID := sess.Metadata["event_id"]
 	if eventID == "" {
 		return nil
@@ -196,16 +203,16 @@ func (h *StripeHandler) handleTicketPurchase(sess *stripe.CheckoutSession) error
 		return nil
 	}
 
-	var ticketPrice float64
 	var eventTitle string
 	var startsAt time.Time
 
 	if err := h.DB.QueryRow(context.Background(),
-		`SELECT ticket_price, title, start_time FROM events WHERE id = $1`,
+		`SELECT title, start_time FROM events WHERE id = $1`,
 		eventID,
-	).Scan(&ticketPrice, &eventTitle, &startsAt); err != nil {
+	).Scan(&eventTitle, &startsAt); err != nil {
 		return fmt.Errorf("fetch event: %w", err)
 	}
+	ticketPrice := float64(sess.AmountTotal) / 100
 
 	// Determine buyer email
 	buyerEmail := guestEmail
@@ -219,20 +226,31 @@ func (h *StripeHandler) handleTicketPurchase(sess *stripe.CheckoutSession) error
 		}
 	}
 
+	tx, err := h.DB.Begin(context.Background())
+	if err != nil {
+		return fmt.Errorf("begin ticket transaction: %w", err)
+	}
+	defer tx.Rollback(context.Background())
+
 	accessToken := services.GenerateTicketCode()
 
 	var ticketID string
 	var insertErr error
 	if buyerID != "" {
-		insertErr = h.DB.QueryRow(context.Background(),
-			`INSERT INTO tickets (event_id, buyer_id, access_token) VALUES ($1, $2, $3) RETURNING id`,
-			eventID, buyerID, accessToken,
+		insertErr = tx.QueryRow(context.Background(),
+			`INSERT INTO tickets (event_id, buyer_id, access_token, stripe_checkout_session_id)
+			 VALUES ($1, $2, $3, $4) ON CONFLICT (stripe_checkout_session_id) DO NOTHING RETURNING id`,
+			eventID, buyerID, accessToken, sess.ID,
 		).Scan(&ticketID)
 	} else {
-		insertErr = h.DB.QueryRow(context.Background(),
-			`INSERT INTO tickets (event_id, buyer_id, guest_email, access_token) VALUES ($1, NULL, $2, $3) RETURNING id`,
-			eventID, guestEmail, accessToken,
+		insertErr = tx.QueryRow(context.Background(),
+			`INSERT INTO tickets (event_id, buyer_id, guest_email, access_token, stripe_checkout_session_id)
+			 VALUES ($1, NULL, $2, $3, $4) ON CONFLICT (stripe_checkout_session_id) DO NOTHING RETURNING id`,
+			eventID, guestEmail, accessToken, sess.ID,
 		).Scan(&ticketID)
+	}
+	if errors.Is(insertErr, pgx.ErrNoRows) {
+		return nil // Stripe retried an already-processed Checkout Session.
 	}
 	if insertErr != nil {
 		return fmt.Errorf("insert ticket: %w", insertErr)
@@ -264,14 +282,26 @@ func (h *StripeHandler) handleTicketPurchase(sess *stripe.CheckoutSession) error
 	if payoutGateway == "stripe" {
 		hostPayout = split.StripeDestinationPayout()
 	}
-	if _, err := h.DB.Exec(context.Background(),
+	if _, err := tx.Exec(context.Background(),
 		`INSERT INTO ledger_entries (ticket_id, event_id, gross_amount, stripe_fee, platform_fee, host_payout, payout_gateway, payout_status)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
 		ticketID, eventID, split.GrossAmount, split.StripeFee, split.PlatformFee, hostPayout, payoutGateway, payoutStatus,
 	); err != nil {
 		return fmt.Errorf("insert ledger: %w", err)
 	}
+	if err := tx.Commit(context.Background()); err != nil {
+		return fmt.Errorf("commit ticket transaction: %w", err)
+	}
 
 	sendTicketEmail(h.DB, h.Email, buyerEmail, accessToken)
 	return nil
+}
+
+func stripeTicketSessionPaid(sess *stripe.CheckoutSession) bool {
+	return sess != nil &&
+		sess.Metadata["type"] == "ticket" &&
+		sess.Metadata["event_id"] != "" &&
+		sess.PaymentStatus == stripe.CheckoutSessionPaymentStatusPaid &&
+		strings.EqualFold(string(sess.Currency), "usd") &&
+		sess.AmountTotal > 0
 }
