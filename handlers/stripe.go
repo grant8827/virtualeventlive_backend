@@ -171,6 +171,16 @@ func (h *StripeHandler) handleVenueFeePaid(sess *stripe.CheckoutSession) error {
 	if eventID == "" {
 		return nil
 	}
+	var venueFee float64
+	if err := h.DB.QueryRow(context.Background(),
+		`SELECT venue_fee FROM events WHERE id = $1`, eventID,
+	).Scan(&venueFee); err != nil {
+		return fmt.Errorf("event %s: %w", eventID, err)
+	}
+	// Same check as the return page: paid, in full, for this event.
+	if !venueFeeStripeSessionMatches(sess, eventID, venueFee) {
+		return fmt.Errorf("session %s is not a full paid booking fee for event %s", sess.ID, eventID)
+	}
 	return activateVenuePaidEvent(context.Background(), h.DB, h.IVS, eventID)
 }
 
@@ -262,11 +272,6 @@ func (h *StripeHandler) handleTicketPurchase(sess *stripe.CheckoutSession) error
 		return fmt.Errorf("insert ledger: %w", err)
 	}
 
-	if buyerEmail != "" {
-		if err := h.Email.SendTicketConfirmation(buyerEmail, eventTitle, accessToken, startsAt); err != nil {
-			fmt.Printf("email send failed (non-fatal): %v\n", err)
-		}
-	}
-
+	sendTicketEmail(h.DB, h.Email, buyerEmail, accessToken)
 	return nil
 }

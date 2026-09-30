@@ -76,7 +76,7 @@ func Load() *Config {
 		SMTPPort:            getEnv("SMTP_PORT", "587"),
 		SMTPUsername:        getEnv("SMTP_USERNAME", ""),
 		SMTPPassword:        getEnv("SMTP_PASSWORD", ""),
-		HourlyRate:          getFloat("HOURLY_RATE", 20.0),
+		HourlyRate:          getFloat("HOURLY_RATE", 15.0),
 		AllowPaymentBypass:  getEnv("ALLOW_PAYMENT_BYPASS", "false") == "true",
 		AWSAccessKeyID:      getEnv("AWS_ACCESS_KEY_ID", ""),
 		AWSSecretAccessKey:  getEnv("AWS_SECRET_ACCESS_KEY", ""),

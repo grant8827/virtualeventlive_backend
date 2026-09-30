@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"html"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -33,52 +35,89 @@ func (e *EmailService) smtpReady() bool {
 	return e.SMTPHost != "" && (e.SMTPUsername == "" || e.SMTPPassword != "")
 }
 
-func (e *EmailService) SendTicketConfirmation(toEmail, eventTitle, accessToken string, startsAt time.Time) error {
+// TicketEmail is everything the buyer's ticket email shows.
+type TicketEmail struct {
+	EventID      string
+	EventTitle   string
+	StartsAt     time.Time
+	TicketName   string // e.g. "General Admission"
+	TicketType   string // "Virtual" or "Virtual + Location"
+	VenueAddress string // shown for in-person tickets
+	AccessCode   string // unlocks the stream
+	SerialNo     int64  // printed ticket number; door staff can type it to check in
+}
+
+// SendTicketConfirmation emails the buyer their ticket: the access code, a
+// button straight into the stream, and for in-person tickets the ticket
+// number and venue for the door.
+func (e *EmailService) SendTicketConfirmation(toEmail string, t TicketEmail) error {
 	if !e.Enabled() {
 		fmt.Printf("email: not configured (SMTP_HOST / RESEND_API_KEY) — skipping ticket email to %s\n", toEmail)
 		return nil
 	}
 
-	watchURL := e.SiteURL + "/watch/" + accessToken
+	watchURL := fmt.Sprintf("%s/events/%s/watch?code=%s", e.SiteURL, url.PathEscape(t.EventID), url.QueryEscape(t.AccessCode))
 	lookupURL := e.SiteURL + "/tickets"
+	esc := html.EscapeString
 
-	html := fmt.Sprintf(`
+	ticketName := t.TicketName
+	if ticketName == "" {
+		ticketName = "Ticket"
+	}
+	inPerson := ""
+	if t.TicketType == "Virtual + Location" {
+		venue := ""
+		if t.VenueAddress != "" {
+			venue = fmt.Sprintf(`<p style="color:#b3bcd6;font-size:13px;margin:8px 0 0">Venue: %s</p>`, esc(t.VenueAddress))
+		}
+		inPerson = fmt.Sprintf(`
+    <div style="background:#0f1631;border:1px solid #252e52;border-radius:12px;padding:16px 20px;margin:0 0 24px">
+      <p style="color:#8590b0;font-size:12px;margin:0 0 4px">Attending in person? Show this ticket number at the door</p>
+      <p style="font-family:monospace;font-size:22px;font-weight:700;letter-spacing:0.08em;margin:0">#%d</p>%s
+      <p style="color:#8590b0;font-size:12px;margin:8px 0 0">Each ticket can be used once — at the door or on the stream.</p>
+    </div>`, t.SerialNo, venue)
+	}
+
+	body := fmt.Sprintf(`
 <!DOCTYPE html>
 <html>
-<body style="font-family:sans-serif;background:#0a0a0a;color:#fff;padding:40px 20px;margin:0">
+<body style="font-family:sans-serif;background:#080d22;color:#fff;padding:40px 20px;margin:0">
   <div style="max-width:520px;margin:0 auto">
     <h1 style="font-size:22px;margin-bottom:4px">Your ticket is confirmed</h1>
-    <p style="color:#71717a;font-size:14px;margin-top:0">Virtual Event Plus</p>
+    <p style="color:#8590b0;font-size:14px;margin-top:0">Virtual Event Plus</p>
 
-    <div style="background:#18181b;border:1px solid #27272a;border-radius:12px;padding:24px;margin:28px 0">
+    <div style="background:#0f1631;border:1px solid #252e52;border-radius:12px;padding:24px;margin:28px 0">
+      <p style="color:#5a93fc;font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;margin:0 0 6px">%s</p>
       <p style="font-size:18px;font-weight:600;margin:0 0 6px">%s</p>
-      <p style="color:#71717a;font-size:13px;margin:0">%s</p>
+      <p style="color:#8590b0;font-size:13px;margin:0">%s</p>
     </div>
 
-    <p style="color:#a1a1aa;font-size:13px;margin-bottom:6px">Your access code</p>
-    <p style="font-family:monospace;background:#18181b;border:1px solid #27272a;border-radius:8px;padding:12px 16px;font-size:13px;letter-spacing:0.05em;margin:0 0 24px">%s</p>
-
-    <a href="%s" style="display:inline-block;background:#fff;color:#000;padding:12px 28px;border-radius:9999px;font-size:14px;font-weight:600;text-decoration:none">
+    <p style="color:#b3bcd6;font-size:13px;margin-bottom:6px">Your access code</p>
+    <p style="font-family:monospace;background:#0f1631;border:1px solid #252e52;border-radius:8px;padding:12px 16px;font-size:15px;letter-spacing:0.08em;margin:0 0 24px">%s</p>
+%s
+    <a href="%s" style="display:inline-block;background:#0067f9;color:#fff;padding:12px 28px;border-radius:9999px;font-size:14px;font-weight:600;text-decoration:none">
       Watch event
     </a>
 
-    <hr style="border:none;border-top:1px solid #27272a;margin:32px 0">
-    <p style="color:#52525b;font-size:12px">
+    <hr style="border:none;border-top:1px solid #252e52;margin:32px 0">
+    <p style="color:#8590b0;font-size:12px">
       Can't find this email later? Retrieve your tickets at
-      <a href="%s" style="color:#a1a1aa">%s</a> using your email address.
+      <a href="%s" style="color:#5a93fc">%s</a> using your email address.
     </p>
   </div>
 </body>
 </html>`,
-		eventTitle,
-		startsAt.Format("Monday, January 2, 2006 at 3:04 PM MST"),
-		accessToken,
-		watchURL,
-		lookupURL,
-		lookupURL,
+		esc(ticketName),
+		esc(t.EventTitle),
+		esc(t.StartsAt.Format("Monday, January 2, 2006 at 3:04 PM MST")),
+		esc(t.AccessCode),
+		inPerson,
+		esc(watchURL),
+		esc(lookupURL),
+		esc(lookupURL),
 	)
 
-	return e.send(toEmail, "Your ticket for "+eventTitle, html)
+	return e.send(toEmail, "Your ticket for "+t.EventTitle, body)
 }
 
 // SendInvitation emails a registration link to someone a superuser invited.

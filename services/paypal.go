@@ -291,16 +291,30 @@ func (p *PayPalService) CreateCheckoutOrder(order CheckoutOrderRequest) (*Checko
 
 // CaptureCheckoutOrder captures a buyer-approved PayPal order.
 func (p *PayPalService) CaptureCheckoutOrder(orderID string, merchantID ...string) error {
+	_, err := p.CaptureOrder(orderID, merchantID...)
+	return err
+}
+
+// CapturedOrder is what PayPal reports was actually paid, so callers can
+// check the payment belongs to what they're about to fulfil.
+type CapturedOrder struct {
+	Reference string  // the purchase unit's reference_id set at order creation
+	Currency  string  // e.g. USD
+	Amount    float64 // total of the completed captures
+}
+
+// CaptureOrder captures a buyer-approved order and returns what was paid.
+func (p *PayPalService) CaptureOrder(orderID string, merchantID ...string) (*CapturedOrder, error) {
 	if !p.Enabled() {
-		return fmt.Errorf("paypal checkout not configured")
+		return nil, fmt.Errorf("paypal checkout not configured")
 	}
 	token, err := p.accessToken()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req, err := http.NewRequest(http.MethodPost, p.baseURL()+"/v2/checkout/orders/"+url.PathEscape(orderID)+"/capture", bytes.NewBufferString("{}"))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -314,19 +328,48 @@ func (p *PayPalService) CaptureCheckoutOrder(orderID string, merchantID ...strin
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("paypal capture request: %w", err)
+		return nil, fmt.Errorf("paypal capture request: %w", err)
 	}
 	defer resp.Body.Close()
 	var out struct {
-		Status  string `json:"status"`
-		Name    string `json:"name"`
-		Message string `json:"message"`
+		Status        string `json:"status"`
+		Name          string `json:"name"`
+		Message       string `json:"message"`
+		PurchaseUnits []struct {
+			ReferenceID string `json:"reference_id"`
+			Payments    struct {
+				Captures []struct {
+					Status string `json:"status"`
+					Amount struct {
+						CurrencyCode string `json:"currency_code"`
+						Value        string `json:"value"`
+					} `json:"amount"`
+				} `json:"captures"`
+			} `json:"payments"`
+		} `json:"purchase_units"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return fmt.Errorf("paypal capture decode: %w", err)
+		return nil, fmt.Errorf("paypal capture decode: %w", err)
 	}
 	if resp.StatusCode >= 300 || out.Status != "COMPLETED" {
-		return fmt.Errorf("paypal capture failed: %s %s (status %d)", out.Name, out.Message, resp.StatusCode)
+		return nil, fmt.Errorf("paypal capture failed: %s %s (status %d)", out.Name, out.Message, resp.StatusCode)
 	}
-	return nil
+
+	captured := &CapturedOrder{}
+	if len(out.PurchaseUnits) > 0 {
+		unit := out.PurchaseUnits[0]
+		captured.Reference = unit.ReferenceID
+		for _, c := range unit.Payments.Captures {
+			if c.Status != "COMPLETED" {
+				continue
+			}
+			v, err := strconv.ParseFloat(c.Amount.Value, 64)
+			if err != nil {
+				return nil, fmt.Errorf("paypal capture amount: %w", err)
+			}
+			captured.Amount += v
+			captured.Currency = c.Amount.CurrencyCode
+		}
+	}
+	return captured, nil
 }

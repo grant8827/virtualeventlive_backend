@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"log"
 	"math"
 	"net/url"
 	"strconv"
@@ -116,6 +117,12 @@ func (h *EventHandler) Create(c *fiber.Ctx) error {
 	})
 }
 
+// Pricing is public: the site shows the venue rate from here rather than
+// hard-coding it, so changing HOURLY_RATE updates every page.
+func (h *EventHandler) Pricing(c *fiber.Ctx) error {
+	return c.JSON(fiber.Map{"hourly_rate": h.Cfg.HourlyRate})
+}
+
 func (h *EventHandler) Checkout(c *fiber.Ctx) error {
 	hostID, ok := c.Locals("user_id").(string)
 	if !ok || hostID == "" {
@@ -161,7 +168,7 @@ func (h *EventHandler) Checkout(c *fiber.Ctx) error {
 	}
 	if provider == "paypal" {
 		if h.PayPal == nil || !h.PayPal.Enabled() {
-			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "paypal checkout not configured"})
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "PayPal checkout isn't set up yet (PAYPAL_CLIENT_ID / PAYPAL_CLIENT_SECRET)"})
 		}
 		state, err := h.signVenueFeeState(eventID, hostID, venueFee)
 		if err != nil {
@@ -182,6 +189,12 @@ func (h *EventHandler) Checkout(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"checkout_provider": "paypal", "checkout_url": order.ApprovalURL})
 	}
 
+	// Stripe is the platform's booking-fee processor. When it's explicitly
+	// chosen, a missing key is a setup error — never a free activation.
+	if h.Cfg.StripeSecretKey == "" && provider == "stripe" {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Stripe checkout isn't set up yet (STRIPE_SECRET_KEY)"})
+	}
+
 	// No payment provider configured — bypass payment and mark event as paid
 	// directly. Flagged as bypassed so it isn't counted as venue-fee revenue.
 	if h.Cfg.StripeSecretKey == "" {
@@ -195,8 +208,17 @@ func (h *EventHandler) Checkout(c *fiber.Ctx) error {
 
 	stripe.Key = h.Cfg.StripeSecretKey
 
+	// The host comes back through the backend, which confirms the payment
+	// with Stripe before activating — so it works even where Stripe's webhook
+	// can't reach us (local development). The webhook does the same check.
+	returnURL := fmt.Sprintf("%s/api/v1/events/%s/stripe/complete?session_id={CHECKOUT_SESSION_ID}",
+		strings.TrimRight(c.BaseURL(), "/"), url.PathEscape(eventID))
+
 	params := &stripe.CheckoutSessionParams{
 		Mode: stripe.String(string(stripe.CheckoutSessionModePayment)),
+		// Card only: card payments are confirmed immediately, so a completed
+		// checkout is always a paid one.
+		PaymentMethodTypes: []*string{stripe.String("card")},
 		LineItems: []*stripe.CheckoutSessionLineItemParams{
 			{
 				PriceData: &stripe.CheckoutSessionLineItemPriceDataParams{
@@ -205,13 +227,13 @@ func (h *EventHandler) Checkout(c *fiber.Ctx) error {
 						Name:        stripe.String("Venue rental — " + title),
 						Description: stripe.String("Virtual Event Plus streaming venue fee"),
 					},
-					UnitAmount: stripe.Int64(int64(venueFee * 100)),
+					UnitAmount: stripe.Int64(int64(math.Round(venueFee * 100))),
 				},
 				Quantity: stripe.Int64(1),
 			},
 		},
-		SuccessURL: stripe.String(h.Cfg.FrontendURL + "/dashboard?venue_paid=1"),
-		CancelURL:  stripe.String(h.Cfg.FrontendURL + "/dashboard"),
+		SuccessURL: stripe.String(returnURL),
+		CancelURL:  stripe.String(h.Cfg.FrontendURL + "/dashboard?venue_paid=0"),
 		Metadata: map[string]string{
 			"type":     "venue_fee",
 			"event_id": eventID,
@@ -335,13 +357,79 @@ func (h *EventHandler) PayPalComplete(c *fiber.Ctx) error {
 	if err := h.verifyVenueFeeState(state, eventID, hostID, venueFee); err != nil {
 		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
 	}
-	if h.PayPal == nil || h.PayPal.CaptureCheckoutOrder(orderID) != nil {
+	if h.PayPal == nil {
+		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
+	}
+	captured, err := h.PayPal.CaptureOrder(orderID)
+	if err != nil {
+		log.Printf("venue fee: PayPal capture failed for event %s: %v", eventID, err)
+		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
+	}
+	// The order ID comes from the return URL, so confirm PayPal took payment
+	// for this event's fee — not a cheaper order made for another event.
+	if !venueFeePaymentMatches(captured, eventID, venueFee) {
+		log.Printf("venue fee: PayPal order %s does not match event %s (paid %s %.2f for %q, expected USD %.2f)",
+			orderID, eventID, captured.Currency, captured.Amount, captured.Reference, venueFee)
 		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
 	}
 	if err := activateVenuePaidEvent(context.Background(), h.DB, h.IVS, eventID); err != nil {
 		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
 	}
 	return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=1")
+}
+
+// StripeComplete is where Stripe sends the host after paying the booking
+// fee. The session ID comes from the URL, so the payment is re-read from
+// Stripe and checked before the event is activated.
+func (h *EventHandler) StripeComplete(c *fiber.Ctx) error {
+	eventID := c.Params("id")
+	fail := func() error { return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0") }
+
+	sessionID := c.Query("session_id")
+	if sessionID == "" || h.Cfg.StripeSecretKey == "" {
+		return fail()
+	}
+	var venueFee float64
+	if err := h.DB.QueryRow(context.Background(),
+		`SELECT venue_fee FROM events WHERE id = $1`, eventID,
+	).Scan(&venueFee); err != nil {
+		return fail()
+	}
+
+	stripe.Key = h.Cfg.StripeSecretKey
+	sess, err := session.Get(sessionID, nil)
+	if err != nil {
+		log.Printf("venue fee: Stripe session %s lookup failed: %v", sessionID, err)
+		return fail()
+	}
+	if !venueFeeStripeSessionMatches(sess, eventID, venueFee) {
+		log.Printf("venue fee: Stripe session %s does not match event %s", sessionID, eventID)
+		return fail()
+	}
+	if err := activateVenuePaidEvent(context.Background(), h.DB, h.IVS, eventID); err != nil {
+		return fail()
+	}
+	return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=1")
+}
+
+// venueFeeStripeSessionMatches checks a Stripe Checkout session is a paid
+// booking fee for this event, for the full amount in USD.
+func venueFeeStripeSessionMatches(sess *stripe.CheckoutSession, eventID string, venueFee float64) bool {
+	return sess != nil &&
+		sess.Metadata["type"] == "venue_fee" &&
+		sess.Metadata["event_id"] == eventID &&
+		sess.PaymentStatus == stripe.CheckoutSessionPaymentStatusPaid &&
+		strings.EqualFold(string(sess.Currency), "usd") &&
+		sess.AmountTotal == int64(math.Round(venueFee*100))
+}
+
+// venueFeePaymentMatches checks a captured PayPal order is the venue fee for
+// this event: the reference set by Checkout, in USD, for the full amount.
+func venueFeePaymentMatches(captured *services.CapturedOrder, eventID string, venueFee float64) bool {
+	return captured != nil &&
+		captured.Reference == "venue-fee-"+eventID &&
+		captured.Currency == "USD" &&
+		math.Round(captured.Amount*100) == math.Round(venueFee*100)
 }
 
 func (h *EventHandler) signVenueFeeState(eventID, hostID string, venueFee float64) (string, error) {

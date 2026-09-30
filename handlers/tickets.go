@@ -339,9 +339,7 @@ func (h *TicketHandler) GuestPurchase(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to create ticket"})
 		}
 
-		if h.Email != nil {
-			_ = h.Email.SendTicketConfirmation(req.Email, eventTitle, accessToken, startsAt)
-		}
+		sendTicketEmail(h.DB, h.Email, req.Email, accessToken)
 
 		return c.JSON(fiber.Map{
 			"access_token": accessToken,
@@ -461,6 +459,7 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 		if _, err := h.DB.Exec(context.Background(), `INSERT INTO tickets (event_id, buyer_id, access_token) VALUES ($1,$2,$3)`, req.EventID, buyerID, accessToken); err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to create ticket"})
 		}
+		sendTicketEmail(h.DB, h.Email, buyerEmail, accessToken)
 		return c.JSON(fiber.Map{"access_token": accessToken, "event_id": req.EventID})
 	}
 	if payoutGateway == "paypal" {
@@ -657,12 +656,7 @@ func (h *TicketHandler) completePayPalTicketOrder(ctx context.Context, orderID s
 	if err = tx.Commit(ctx); err != nil {
 		return buyerEmail, false, err
 	}
-	var eventTitle string
-	var startsAt time.Time
-	_ = h.DB.QueryRow(ctx, `SELECT title,start_time FROM events WHERE id=$1`, eventID).Scan(&eventTitle, &startsAt)
-	if h.Email != nil {
-		_ = h.Email.SendTicketConfirmation(buyerEmail, eventTitle, accessToken, startsAt)
-	}
+	sendTicketEmail(h.DB, h.Email, buyerEmail, accessToken)
 	return buyerEmail, false, nil
 }
 

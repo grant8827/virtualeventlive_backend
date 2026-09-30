@@ -87,6 +87,7 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 		},
 		PayPal: newPayPalService(cfg),
 	}
+	v1.Get("/pricing", eventH.Pricing)
 	v1.Get("/events/public", eventH.ListPublic)
 	v1.Get("/events/:id", eventH.GetByID)
 	v1.Get("/events/:id/wipay/launch", eventH.WiPayLaunch)
@@ -101,6 +102,8 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	// for browser redirects and manually opened return links.
 	v1.Post("/events/:id/wipay/complete", eventH.WiPayComplete)
 	v1.Get("/events/:id/paypal/complete", eventH.PayPalComplete)
+	// Booking fee: Stripe sends the host back here after checkout.
+	v1.Get("/events/:id/stripe/complete", eventH.StripeComplete)
 	v1.Patch("/events/:id/ticket", middleware.Protected(cfg.JWTSecret), hostStaff, eventAccess, eventH.TicketSetup)
 	v1.Post("/events/:id/bypass-activate", middleware.Protected(cfg.JWTSecret), hostAdmin, eventH.BypassActivate)
 	v1.Delete("/events/:id", middleware.Protected(cfg.JWTSecret), hostAdmin, eventH.Delete)
