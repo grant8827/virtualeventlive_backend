@@ -144,66 +144,11 @@ func (h *EventHandler) Checkout(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "venue fee already paid"})
 	}
 
-	provider := strings.ToLower(strings.TrimSpace(h.Cfg.VenueFeeProvider))
-	if provider == "" {
-		provider = "auto"
-	}
-
-	if provider == "wipay" || (provider == "auto" && h.WiPay != nil && h.WiPay.CheckoutEnabled()) {
-		state, err := h.signVenueFeeState(eventID, hostID, venueFee)
-		if err != nil {
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to prepare WiPay checkout"})
-		}
-
-		launchURL := fmt.Sprintf("%s/api/v1/events/%s/wipay/launch?state=%s",
-			strings.TrimRight(c.BaseURL(), "/"),
-			url.PathEscape(eventID),
-			url.QueryEscape(state),
-		)
-
-		return c.JSON(fiber.Map{
-			"checkout_provider": "wipay",
-			"checkout_url":      launchURL,
-		})
-	}
-	if provider == "paypal" {
-		if h.PayPal == nil || !h.PayPal.Enabled() {
-			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "PayPal checkout isn't set up yet (PAYPAL_CLIENT_ID / PAYPAL_CLIENT_SECRET)"})
-		}
-		state, err := h.signVenueFeeState(eventID, hostID, venueFee)
-		if err != nil {
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to prepare PayPal checkout"})
-		}
-		returnURL := fmt.Sprintf("%s/api/v1/events/%s/paypal/complete?state=%s",
-			strings.TrimRight(c.BaseURL(), "/"), url.PathEscape(eventID), url.QueryEscape(state))
-		order, err := h.PayPal.CreateCheckoutOrder(services.CheckoutOrderRequest{
-			Amount:      venueFee,
-			Description: "Virtual Event Plus venue fee - " + title,
-			Reference:   "venue-fee-" + eventID,
-			ReturnURL:   returnURL,
-			CancelURL:   h.Cfg.FrontendURL + "/dashboard?venue_paid=0",
-		})
-		if err != nil {
-			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "failed to create PayPal checkout"})
-		}
-		return c.JSON(fiber.Map{"checkout_provider": "paypal", "checkout_url": order.ApprovalURL})
-	}
-
-	// Stripe is the platform's booking-fee processor. When it's explicitly
-	// chosen, a missing key is a setup error — never a free activation.
-	if h.Cfg.StripeSecretKey == "" && provider == "stripe" {
-		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Stripe checkout isn't set up yet (STRIPE_SECRET_KEY)"})
-	}
-
-	// No payment provider configured — bypass payment and mark event as paid
-	// directly. Flagged as bypassed so it isn't counted as venue-fee revenue.
+	// Event booking is a separate platform purchase and always belongs to the
+	// platform Stripe account. The host's selected ticket payout gateway is
+	// intentionally not consulted here.
 	if h.Cfg.StripeSecretKey == "" {
-		if _, err := h.DB.Exec(context.Background(),
-			`UPDATE events SET venue_paid = true, is_active = true, venue_bypassed = true WHERE id = $1`, eventID,
-		); err != nil {
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to activate event"})
-		}
-		return c.JSON(fiber.Map{"checkout_url": h.Cfg.FrontendURL + "/dashboard?venue_paid=1"})
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Stripe event booking checkout is not configured"})
 	}
 
 	stripe.Key = h.Cfg.StripeSecretKey
@@ -224,8 +169,8 @@ func (h *EventHandler) Checkout(c *fiber.Ctx) error {
 				PriceData: &stripe.CheckoutSessionLineItemPriceDataParams{
 					Currency: stripe.String("usd"),
 					ProductData: &stripe.CheckoutSessionLineItemPriceDataProductDataParams{
-						Name:        stripe.String("Venue rental — " + title),
-						Description: stripe.String("Virtual Event Plus streaming venue fee"),
+						Name:        stripe.String("Event booking platform fee — " + title),
+						Description: stripe.String("Virtual Event Plus event booking and activation fee"),
 					},
 					UnitAmount: stripe.Int64(int64(math.Round(venueFee * 100))),
 				},
@@ -246,7 +191,7 @@ func (h *EventHandler) Checkout(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to create checkout session"})
 	}
 
-	return c.JSON(fiber.Map{"checkout_url": s.URL})
+	return c.JSON(fiber.Map{"checkout_provider": "stripe", "checkout_url": s.URL})
 }
 
 func (h *EventHandler) WiPayLaunch(c *fiber.Ctx) error {
