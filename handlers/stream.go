@@ -10,7 +10,7 @@ import (
 )
 
 type StreamHandler struct {
-	DB    *pgxpool.Pool
+	DB       *pgxpool.Pool
 	Guard    *services.SessionGuard
 	Playback *PlaybackAccess
 }

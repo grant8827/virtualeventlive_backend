@@ -287,6 +287,12 @@ func (h *TicketHandler) issueFreeTicket(ctx context.Context, eventID string, buy
 	}
 	defer tx.Rollback(ctx)
 
+	// The sales rule, checked with the event row locked so concurrent
+	// requests can't oversell or slip past a cancellation.
+	if err := canSellTickets(ctx, tx, eventID, true); err != nil {
+		return "", "", err
+	}
+
 	accessToken = services.GenerateTicketCode()
 	var ticketID string
 	if err := tx.QueryRow(ctx,

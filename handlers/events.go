@@ -741,17 +741,17 @@ func (h *EventHandler) GetByID(c *fiber.Ctx) error {
 	expired := endsAt != nil && time.Now().After(*endsAt)
 
 	return c.JSON(fiber.Map{
-		"id":               eventID,
-		"host_id":          hostID,
-		"title":            title,
-		"description":      description,
-		"starts_at":        startsAt,
-		"ends_at":          endsAt,
-		"ticket_price":     ticketPrice,
-		"ticket_type":      ticketType,
-		"venue_address":    venueAddress,
-		"is_active":        isActive,
-		"expired":          expired,
+		"id":            eventID,
+		"host_id":       hostID,
+		"title":         title,
+		"description":   description,
+		"starts_at":     startsAt,
+		"ends_at":       endsAt,
+		"ticket_price":  ticketPrice,
+		"ticket_type":   ticketType,
+		"venue_address": venueAddress,
+		"is_active":     isActive,
+		"expired":       expired,
 		// Public: whether the event has a stream channel, never its playback
 		// URL. Playback is only issued by /tickets/enter after a ticket check.
 		"has_stream": playbackURL != nil && *playbackURL != "",

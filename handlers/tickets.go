@@ -298,12 +298,15 @@ func (h *TicketHandler) GuestPurchase(c *fiber.Ctx) error {
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "event not found or not available"})
 	}
+	if err := canSellTickets(context.Background(), h.DB, req.EventID, false); err != nil {
+		return saleRuleResponse(c, err)
+	}
 
 	// Free tickets do not need a configured payment processor.
 	if ticketPrice == 0 {
 		accessToken, claim, err := h.issueFreeTicket(context.Background(), req.EventID, nil, &req.Email)
 		if err != nil {
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to create ticket"})
+			return saleRuleResponse(c, err)
 		}
 		sendTicketEmail(h.DB, h.Email, req.Email, accessToken)
 
@@ -362,8 +365,11 @@ func (h *TicketHandler) GuestPurchase(c *fiber.Ctx) error {
 			},
 		},
 		CustomerEmail: stripe.String(req.Email),
-		SuccessURL:    stripe.String(h.Cfg.FrontendURL + "/ticket-success?claim=" + url.QueryEscape(claimToken)),
-		CancelURL:     stripe.String(h.Cfg.FrontendURL + "/events/" + req.EventID),
+		// Shortest Stripe allows: narrows the gap between "on sale" at
+		// checkout and payment completing.
+		ExpiresAt:  stripe.Int64(time.Now().Add(30 * time.Minute).Unix()),
+		SuccessURL: stripe.String(h.Cfg.FrontendURL + "/ticket-success?claim=" + url.QueryEscape(claimToken)),
+		CancelURL:  stripe.String(h.Cfg.FrontendURL + "/events/" + req.EventID),
 		Metadata: map[string]string{
 			"type":        "ticket",
 			"event_id":    req.EventID,
@@ -431,10 +437,13 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 			"error": "event not found, not yet published, or host has not connected a payout account",
 		})
 	}
+	if err := canSellTickets(context.Background(), h.DB, req.EventID, false); err != nil {
+		return saleRuleResponse(c, err)
+	}
 	if ticketPrice == 0 {
 		accessToken, claim, err := h.issueFreeTicket(context.Background(), req.EventID, &buyerID, nil)
 		if err != nil {
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to create ticket"})
+			return saleRuleResponse(c, err)
 		}
 		sendTicketEmail(h.DB, h.Email, buyerEmail, accessToken)
 		return c.JSON(fiber.Map{"access_token": accessToken, "event_id": req.EventID, "claim": claim})
@@ -474,6 +483,7 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 			},
 		},
 		CustomerEmail: stripe.String(buyerEmail),
+		ExpiresAt:     stripe.Int64(time.Now().Add(30 * time.Minute).Unix()),
 		SuccessURL:    stripe.String(h.Cfg.FrontendURL + "/ticket-success?claim=" + url.QueryEscape(claimToken)),
 		CancelURL:     stripe.String(h.Cfg.FrontendURL + "/events/" + req.EventID),
 		Metadata: map[string]string{
@@ -623,6 +633,12 @@ func (h *TicketHandler) completePayPalTicketOrder(ctx context.Context, orderID s
 	}
 	if status == "completed" {
 		return buyerEmail, true, nil
+	}
+	// Re-check the sales rule before taking the money: if the event was
+	// cancelled, disabled, ended or sold out since checkout started, the
+	// order is never captured and the buyer isn't charged.
+	if err := canSellTickets(ctx, tx, eventID, true); err != nil {
+		return buyerEmail, false, err
 	}
 	if err := h.PayPal.CaptureCheckoutOrder(orderID, merchantID); err != nil {
 		return buyerEmail, false, err
