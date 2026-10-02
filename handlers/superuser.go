@@ -126,13 +126,14 @@ func (h *SuperuserHandler) Overview(c *fiber.Ctx) error {
 		Last30 int `json:"last_30d"`
 	}
 	if err := h.DB.QueryRow(ctx,
-		`SELECT count(*), count(*) FILTER (WHERE purchased_at > NOW() - INTERVAL '30 days') FROM tickets`,
+		`SELECT count(*), count(*) FILTER (WHERE purchased_at > NOW() - INTERVAL '30 days') FROM tickets WHERE voided_at IS NULL`,
 	).Scan(&tickets.Total, &tickets.Last30); err != nil {
 		return fail()
 	}
 
-	// Ticket money comes from the ledger (paid sales only); venue fees from
-	// events whose fee was really paid, not bypassed.
+	// Money comes from the order books and the ledger (Phase 2): gross is
+	// what buyers paid; fees and payouts are net of refunds; processing
+	// fees are Stripe's actual fees once reconciled.
 	var revenue struct {
 		GrossSales     float64 `json:"gross_sales"`
 		PlatformFees   float64 `json:"platform_fees"`
@@ -140,17 +141,29 @@ func (h *SuperuserHandler) Overview(c *fiber.Ctx) error {
 		HostPayouts    float64 `json:"host_payouts"`
 		PendingPayouts float64 `json:"pending_payouts"`
 		VenueFees      float64 `json:"venue_fees"`
+		Refunds        float64 `json:"refunds"`
+		DisputeLosses  float64 `json:"dispute_losses"`
+		NeedsAttention int     `json:"needs_attention_orders"`
 	}
 	if err := h.DB.QueryRow(ctx,
-		`SELECT COALESCE(SUM(gross_amount), 0)::float8,
-		        COALESCE(SUM(platform_fee), 0)::float8,
-		        COALESCE(SUM(stripe_fee), 0)::float8,
-		        COALESCE(SUM(host_payout), 0)::float8,
-		        COALESCE(SUM(host_payout) FILTER (WHERE payout_status = 'pending'), 0)::float8,
-		        (SELECT COALESCE(SUM(venue_fee), 0)::float8 FROM events WHERE venue_paid AND NOT venue_bypassed)
-		 FROM ledger_entries`,
+		`WITH acct AS (
+		     SELECT p.account, j.kind, SUM(p.amount_cents) AS cents
+		     FROM ledger_postings p JOIN ledger_journal j ON j.id = p.journal_id
+		     GROUP BY p.account, j.kind)
+		 SELECT (SELECT COALESCE(SUM(amount_cents), 0) FROM orders o WHERE o.kind = 'ticket'
+		           AND EXISTS(SELECT 1 FROM ledger_journal j WHERE j.order_id = o.id AND j.kind = 'sale'))::float8 / 100,
+		        (SELECT COALESCE(-SUM(cents), 0) FROM acct WHERE account = 'platform_commission')::float8 / 100,
+		        (SELECT COALESCE(SUM(cents), 0) FROM acct WHERE account = 'processing_fees')::float8 / 100,
+		        (SELECT COALESCE(SUM(cents), 0) FROM acct WHERE account = 'host_payable'
+		           AND kind IN ('host_transfer', 'host_transfer_reversal', 'host_transfer_restore'))::float8 / 100,
+		        (SELECT COALESCE(-SUM(cents), 0) FROM acct WHERE account = 'host_payable')::float8 / 100,
+		        (SELECT COALESCE(-SUM(cents), 0) FROM acct WHERE account = 'booking_fee_revenue')::float8 / 100,
+		        (SELECT COALESCE(SUM(refunded_cents), 0) FROM orders)::float8 / 100,
+		        (SELECT COALESCE(SUM(cents), 0) FROM acct WHERE account = 'dispute_losses')::float8 / 100,
+		        (SELECT count(*) FROM orders WHERE status = 'needs_attention')`,
 	).Scan(&revenue.GrossSales, &revenue.PlatformFees, &revenue.ProcessingFees,
-		&revenue.HostPayouts, &revenue.PendingPayouts, &revenue.VenueFees); err != nil {
+		&revenue.HostPayouts, &revenue.PendingPayouts, &revenue.VenueFees,
+		&revenue.Refunds, &revenue.DisputeLosses, &revenue.NeedsAttention); err != nil {
 		return fail()
 	}
 
@@ -160,8 +173,9 @@ func (h *SuperuserHandler) Overview(c *fiber.Ctx) error {
 			SELECT generate_series(CURRENT_DATE - 29, CURRENT_DATE, INTERVAL '1 day')::date AS d
 		 )
 		 SELECT to_char(days.d, 'YYYY-MM-DD'),
-		        (SELECT count(*) FROM tickets t WHERE t.purchased_at::date = days.d),
-		        (SELECT COALESCE(SUM(gross_amount), 0)::float8 FROM ledger_entries l WHERE l.settled_at::date = days.d),
+		        (SELECT count(*) FROM tickets t WHERE t.purchased_at::date = days.d AND t.voided_at IS NULL),
+		        (SELECT COALESCE(SUM(o.amount_cents), 0)::float8 / 100 FROM orders o
+		           WHERE o.kind = 'ticket' AND o.status IN ('paid', 'needs_attention') AND o.paid_at::date = days.d),
 		        (SELECT count(*) FROM users u WHERE u.created_at::date = days.d)
 		 FROM days ORDER BY days.d`,
 	)
@@ -183,8 +197,8 @@ func (h *SuperuserHandler) Overview(c *fiber.Ctx) error {
 		`SELECT u.id, u.full_name, u.email,
 		        (SELECT count(*) FROM events e WHERE e.host_id = u.id),
 		        (SELECT count(*) FROM tickets t JOIN events e ON e.id = t.event_id WHERE e.host_id = u.id),
-		        (SELECT COALESCE(SUM(l.gross_amount), 0)::float8 FROM ledger_entries l
-		           JOIN events e ON e.id = l.event_id WHERE e.host_id = u.id) AS gross
+		        (SELECT COALESCE(SUM(o.amount_cents), 0)::float8 / 100 FROM orders o
+		           WHERE o.host_id = u.id AND o.kind = 'ticket' AND o.status IN ('paid', 'needs_attention')) AS gross
 		 FROM users u WHERE u.role = 'host'
 		 ORDER BY gross DESC, 5 DESC LIMIT 5`,
 	)
@@ -312,8 +326,8 @@ const platformUserSelect = `
 	SELECT u.id, u.email, u.full_name, u.organization_name, u.role, u.status, o.email,
 	       (SELECT count(*) FROM events e WHERE e.host_id = u.id),
 	       (SELECT count(*) FROM tickets t JOIN events e ON e.id = t.event_id WHERE e.host_id = u.id),
-	       (SELECT COALESCE(SUM(l.gross_amount), 0)::float8 FROM ledger_entries l
-	          JOIN events e ON e.id = l.event_id WHERE e.host_id = u.id),
+	       (SELECT COALESCE(SUM(o.amount_cents), 0)::float8 / 100 FROM orders o
+	          WHERE o.host_id = u.id AND o.kind = 'ticket' AND o.status IN ('paid', 'needs_attention')),
 	       u.created_at
 	FROM users u LEFT JOIN users o ON o.id = u.account_owner_id`
 
@@ -532,9 +546,11 @@ const platformEventSelect = `
 	SELECT e.id, e.title, e.event_type, e.start_time, e.ends_at, e.host_id, u.full_name, u.email,
 	       e.venue_fee::float8, e.venue_paid, e.venue_bypassed, e.is_active, (e.ends_at < NOW()),
 	       (e.cancelled_at IS NOT NULL),
-	       (SELECT count(*) FROM tickets t WHERE t.event_id = e.id),
-	       (SELECT COALESCE(SUM(l.gross_amount), 0)::float8 FROM ledger_entries l WHERE l.event_id = e.id),
-	       (SELECT COALESCE(SUM(l.platform_fee), 0)::float8 FROM ledger_entries l WHERE l.event_id = e.id),
+	       (SELECT count(*) FROM tickets t WHERE t.event_id = e.id AND t.voided_at IS NULL),
+	       (SELECT COALESCE(SUM(o.amount_cents), 0)::float8 / 100 FROM orders o
+	          WHERE o.event_id = e.id AND o.kind = 'ticket' AND o.status IN ('paid', 'needs_attention')),
+	       (SELECT COALESCE(SUM(o.platform_fee_cents - o.platform_fee_refunded_cents), 0)::float8 / 100 FROM orders o
+	          WHERE o.event_id = e.id AND o.kind = 'ticket' AND o.status IN ('paid', 'needs_attention')),
 	       e.aws_channel_arn
 	FROM events e JOIN users u ON u.id = e.host_id`
 

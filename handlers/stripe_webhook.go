@@ -10,8 +10,6 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5"
 	stripe "github.com/stripe/stripe-go/v82"
-
-	"vertualeventlive/backend/services"
 )
 
 // Stripe webhook handling (PAY-02).
@@ -24,8 +22,10 @@ import (
 //   - temporary failure (database, IVS...) → 500, recorded as failed, so
 //     Stripe retries; the retry runs the same idempotent fulfilment again
 //
-// Fulfilment itself is idempotent too: one ticket per Checkout Session
-// (unique stripe_checkout_session_id) and venue activation under a row lock.
+// Fulfilment itself is idempotent too: every payment belongs to one order,
+// processed under the order's row lock, and every ledger journal has a
+// unique key. Refunds and disputes are keyed by Stripe's own IDs and apply
+// only forward-moving changes, so out-of-order deliveries converge.
 
 type webhookOutcome string
 
@@ -151,6 +151,31 @@ func (h *StripeHandler) processStripeEvent(ctx context.Context, event stripe.Eve
 		}
 		return outcomeIgnored, nil
 
+	case "checkout.session.expired", "checkout.session.async_payment_failed":
+		var sess stripe.CheckoutSession
+		if err := json.Unmarshal(event.Data.Raw, &sess); err != nil {
+			return "", needsAttention("unreadable checkout session")
+		}
+		if event.Type == "checkout.session.expired" {
+			return h.endStripeCheckout(ctx, &sess, "expired", "checkout expired")
+		}
+		return h.endStripeCheckout(ctx, &sess, "failed", "delayed payment failed")
+
+	case "refund.created", "refund.updated", "refund.failed", "charge.refund.updated":
+		var r stripe.Refund
+		if err := json.Unmarshal(event.Data.Raw, &r); err != nil {
+			return "", needsAttention("unreadable refund")
+		}
+		return h.applyStripeRefund(ctx, &r)
+
+	case "charge.dispute.created", "charge.dispute.updated", "charge.dispute.closed",
+		"charge.dispute.funds_withdrawn", "charge.dispute.funds_reinstated":
+		var d stripe.Dispute
+		if err := json.Unmarshal(event.Data.Raw, &d); err != nil {
+			return "", needsAttention("unreadable dispute")
+		}
+		return h.applyStripeDispute(ctx, &d)
+
 	case "account.updated":
 		var acc stripe.Account
 		if err := json.Unmarshal(event.Data.Raw, &acc); err != nil {
@@ -168,127 +193,8 @@ func (h *StripeHandler) processStripeEvent(ctx context.Context, event stripe.Eve
 }
 
 func (h *StripeHandler) fulfillVenueFee(ctx context.Context, sess *stripe.CheckoutSession) (webhookOutcome, error) {
-	eventID := sess.Metadata["event_id"]
-	var venueFee float64
-	if err := h.DB.QueryRow(ctx, `SELECT venue_fee FROM events WHERE id = $1`, eventID).Scan(&venueFee); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return "", needsAttention("booking fee paid for unknown event %s (session %s)", eventID, sess.ID)
-		}
-		return "", fmt.Errorf("load event: %w", err)
+	if err := recordBookingFee(ctx, h.DB, h.IVS, sess); err != nil {
+		return "", err
 	}
-	// Paid, in full, in USD, for this event.
-	if !venueFeeStripeSessionMatches(sess, eventID, venueFee) {
-		return "", needsAttention("session %s is not a full booking-fee payment for event %s", sess.ID, eventID)
-	}
-	if err := activateVenuePaidEvent(ctx, h.DB, h.IVS, eventID); err != nil {
-		if errors.Is(err, errActivateCancelled) {
-			return "", needsAttention("booking fee paid for cancelled event %s (session %s): refund", eventID, sess.ID)
-		}
-		return "", fmt.Errorf("activate event: %w", err)
-	}
-	return outcomeProcessed, nil
-}
-
-// fulfillTicket issues exactly one ticket per paid Checkout Session.
-func (h *StripeHandler) fulfillTicket(ctx context.Context, sess *stripe.CheckoutSession) (webhookOutcome, error) {
-	if !stripeTicketSessionPaid(sess) {
-		return "", needsAttention("session %s is not a completed USD ticket payment", sess.ID)
-	}
-	eventID := sess.Metadata["event_id"]
-	buyerID := sess.Metadata["buyer_id"]
-	guestEmail := sess.Metadata["guest_email"]
-	if buyerID == "" && guestEmail == "" {
-		return "", needsAttention("session %s has no buyer", sess.ID)
-	}
-
-	buyerEmail := guestEmail
-	if buyerID != "" {
-		var userEmail string
-		_ = h.DB.QueryRow(ctx, `SELECT email FROM users WHERE id = $1`, buyerID).Scan(&userEmail)
-		if userEmail != "" {
-			buyerEmail = userEmail
-		}
-	}
-
-	tx, err := h.DB.Begin(ctx)
-	if err != nil {
-		return "", fmt.Errorf("begin ticket transaction: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
-	// Already fulfilled (an earlier delivery, or completed + async_succeeded
-	// for the same session): nothing to do, and no second email.
-	var existing string
-	switch err := tx.QueryRow(ctx, `SELECT id FROM tickets WHERE stripe_checkout_session_id = $1`, sess.ID).Scan(&existing); {
-	case err == nil:
-		return outcomeProcessed, nil
-	case !errors.Is(err, pgx.ErrNoRows):
-		return "", fmt.Errorf("check existing ticket: %w", err)
-	}
-
-	// The sales rule, with the event locked. The buyer has paid, so a
-	// refusal here means a manual refund rather than a retry.
-	if err := canSellTickets(ctx, tx, eventID, true); err != nil {
-		if isSaleRuleError(err) {
-			return "", needsAttention("paid session %s for event %s that can no longer sell (%v): refund", sess.ID, eventID, err)
-		}
-		return "", fmt.Errorf("sales rule: %w", err)
-	}
-
-	accessToken := services.GenerateTicketCode()
-	var buyer, guest *string
-	if buyerID != "" {
-		buyer = &buyerID
-	} else {
-		guest = &guestEmail
-	}
-	var ticketID string
-	err = tx.QueryRow(ctx,
-		`INSERT INTO tickets (event_id, buyer_id, guest_email, access_token, stripe_checkout_session_id)
-		 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (stripe_checkout_session_id) DO NOTHING RETURNING id`,
-		eventID, buyer, guest, accessToken, sess.ID,
-	).Scan(&ticketID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return outcomeProcessed, nil // a concurrent delivery won the race
-	}
-	if err != nil {
-		return "", fmt.Errorf("insert ticket: %w", err)
-	}
-
-	var payoutGateway string
-	_ = tx.QueryRow(ctx,
-		`SELECT ca.payout_gateway FROM connected_accounts ca
-		 JOIN events e ON e.host_id = ca.user_id WHERE e.id = $1`, eventID,
-	).Scan(&payoutGateway)
-	if payoutGateway == "" {
-		payoutGateway = "stripe"
-	}
-	// Stripe hosts are paid via destination charge at checkout, so their
-	// entries settle immediately. WiPay/PayPal hosts wait for a manual payout.
-	payoutStatus := "paid"
-	if payoutGateway != "stripe" {
-		payoutStatus = "pending"
-	}
-	split := services.CalculateSplit(float64(sess.AmountTotal) / 100)
-	hostPayout := split.HostPayout
-	if payoutGateway == "stripe" {
-		hostPayout = split.StripeDestinationPayout()
-	}
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO ledger_entries (ticket_id, event_id, gross_amount, stripe_fee, platform_fee, host_payout, payout_gateway, payout_status)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-		ticketID, eventID, split.GrossAmount, split.StripeFee, split.PlatformFee, hostPayout, payoutGateway, payoutStatus,
-	); err != nil {
-		return "", fmt.Errorf("insert ledger: %w", err)
-	}
-	// The buyer's ticket-success page is waiting on this claim.
-	if _, err := tx.Exec(ctx, `UPDATE ticket_claims SET ticket_id = $1 WHERE stripe_session_id = $2`, ticketID, sess.ID); err != nil {
-		return "", fmt.Errorf("attach claim: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return "", fmt.Errorf("commit ticket: %w", err)
-	}
-
-	sendTicketEmail(h.DB, h.Email, buyerEmail, accessToken)
 	return outcomeProcessed, nil
 }

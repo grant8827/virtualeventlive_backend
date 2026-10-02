@@ -272,7 +272,7 @@ func (h *ChatHandler) Register(c *fiber.Ctx) error {
 		`SELECT EXISTS(
 			SELECT 1 FROM tickets t
 			LEFT JOIN users u ON u.id = t.buyer_id
-			WHERE t.event_id = $1 AND (LOWER(u.email) = $2 OR LOWER(t.guest_email) = $2)
+			WHERE t.event_id = $1 AND t.voided_at IS NULL AND (LOWER(u.email) = $2 OR LOWER(t.guest_email) = $2)
 		)`,
 		eventID, req.Email,
 	).Scan(&hasTicket); err != nil || !hasTicket {

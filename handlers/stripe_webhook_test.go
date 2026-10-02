@@ -98,9 +98,10 @@ func TestStripeWebhookSuccessIssuesOneTicketAndAttachesClaim(t *testing.T) {
 		t.Fatalf("%d tickets", n)
 	}
 	var ledger int
-	_ = h.DB.QueryRow(ctx, `SELECT count(*) FROM ledger_entries l JOIN tickets t ON t.id = l.ticket_id WHERE t.stripe_checkout_session_id = $1`, sess.ID).Scan(&ledger)
+	_ = h.DB.QueryRow(ctx, `SELECT count(*) FROM ledger_journal j JOIN orders o ON o.id = j.order_id
+		WHERE o.provider_checkout_id = $1 AND j.kind = 'sale'`, sess.ID).Scan(&ledger)
 	if ledger != 1 {
-		t.Fatalf("%d ledger entries", ledger)
+		t.Fatalf("%d sale journals", ledger)
 	}
 	if status, attempts, _ := webhookRecord(t, evtID); status != "processed" || attempts != 1 {
 		t.Fatalf("record: %s / %d", status, attempts)

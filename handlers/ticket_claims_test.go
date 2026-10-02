@@ -100,14 +100,11 @@ func TestClaimShowsOnlyItsOwnTicket(t *testing.T) {
 	app := ticketTestApp(h)
 
 	// Two tickets for the same email; each claim must return only its own.
-	codeA, claimA, err := h.issueFreeTicket(ctx, event, nil, &email)
+	codeA, claimA, err := h.issueFreeTicket(ctx, event, nil, email)
 	if err != nil {
 		t.Fatal(err)
 	}
-	codeB, _, err := h.issueFreeTicket(ctx, event, nil, &email)
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, codeB := createGuestTicket(t, db, event, email)
 
 	status, body := doReq(t, app, "GET", "/tickets/claim/"+claimA, "")
 	if status != 200 {
@@ -152,7 +149,7 @@ func TestClaimExpiresAndPendingClaimRevealsNothing(t *testing.T) {
 
 	// Expired claim: 410, no ticket data.
 	email := "late-" + uniq() + "@phase0.test"
-	code, claim, err := (&TicketHandler{DB: db}).issueFreeTicket(ctx, event, nil, &email)
+	code, claim, err := (&TicketHandler{DB: db}).issueFreeTicket(ctx, event, nil, email)
 	if err != nil {
 		t.Fatal(err)
 	}

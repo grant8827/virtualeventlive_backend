@@ -2,9 +2,9 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"net/mail"
 	"net/url"
 	"strings"
 	"time"
@@ -42,7 +42,7 @@ func (h *TicketHandler) ListMine(c *fiber.Ctx) error {
 		        e.card_bg_from, e.card_bg_to, e.card_bg_image, e.logo_image, e.venue_address
 		 FROM tickets t
 		 JOIN events e ON e.id = t.event_id
-		 WHERE t.buyer_id = $1
+		 WHERE t.buyer_id = $1 AND t.voided_at IS NULL
 		 ORDER BY t.purchased_at DESC`,
 		buyerID,
 	)
@@ -112,18 +112,23 @@ func (h *TicketHandler) Enter(c *fiber.Ctx) error {
 		cancelled        bool
 		ticketType       string
 		checkedInChannel *string
+		voided           bool
 	)
 	err := h.DB.QueryRow(context.Background(),
 		`SELECT t.id, e.id, e.title, e.is_active, e.ends_at, e.aws_playback_url, e.aws_channel_arn,
-		        e.venue_paid, e.cancelled_at IS NOT NULL, e.ticket_type, t.checked_in_channel
+		        e.venue_paid, e.cancelled_at IS NOT NULL, e.ticket_type, t.checked_in_channel,
+		        t.voided_at IS NOT NULL
 		 FROM tickets t
 		 JOIN events e ON e.id = t.event_id
 		 WHERE t.access_token = $1`,
 		code,
 	).Scan(&ticketID, &eventID, &eventTitle, &isActive, &endsAt, &playbackURL, &channelARN,
-		&venuePaid, &cancelled, &ticketType, &checkedInChannel)
+		&venuePaid, &cancelled, &ticketType, &checkedInChannel, &voided)
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "ticket not found"})
+	}
+	if voided {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "This ticket was refunded or cancelled and is no longer valid."})
 	}
 
 	if time.Now().After(endsAt) {
@@ -142,16 +147,29 @@ func (h *TicketHandler) Enter(c *fiber.Ctx) error {
 	// the SAME channel (e.g. reloading the Watch page) stays unaffected —
 	// it's only a first-claim marker, not a one-time-only gate for virtual.
 	if ticketType == "Virtual + Location" {
-		if checkedInChannel != nil && *checkedInChannel == "physical" {
-			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "This ticket was already used to check in at the venue."})
-		}
 		if checkedInChannel == nil {
-			if _, err := h.DB.Exec(context.Background(),
-				`UPDATE tickets SET checked_in_at = NOW(), checked_in_channel = 'virtual' WHERE id = $1`,
+			// Claim the ticket for the stream only if nobody has claimed it
+			// yet (PAY-10): a door scan racing this request can't both win.
+			tag, err := h.DB.Exec(context.Background(),
+				`UPDATE tickets SET checked_in_at = NOW(), checked_in_channel = 'virtual'
+				 WHERE id = $1 AND checked_in_channel IS NULL AND voided_at IS NULL`,
 				ticketID,
-			); err != nil {
+			)
+			if err != nil {
 				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to record entry"})
 			}
+			if tag.RowsAffected() == 0 {
+				// Someone else claimed it first; read who (a new statement,
+				// so it sees their committed write).
+				if err := h.DB.QueryRow(context.Background(),
+					`SELECT checked_in_channel FROM tickets WHERE id = $1`, ticketID,
+				).Scan(&checkedInChannel); err != nil || checkedInChannel == nil {
+					return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to record entry"})
+				}
+			}
+		}
+		if checkedInChannel != nil && *checkedInChannel == "physical" {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "This ticket was already used to check in at the venue."})
 		}
 	}
 
@@ -208,14 +226,16 @@ func (h *TicketHandler) CheckIn(c *fiber.Ctx) error {
 		ticketType       string
 		checkedInAt      *time.Time
 		checkedInChannel *string
+		voided           bool
 	)
 	err := h.DB.QueryRow(context.Background(),
-		`SELECT t.id, t.serial_no, e.title, e.host_id, e.assigned_to, e.ticket_type, t.checked_in_at, t.checked_in_channel
+		`SELECT t.id, t.serial_no, e.title, e.host_id, e.assigned_to, e.ticket_type, t.checked_in_at, t.checked_in_channel,
+		        t.voided_at IS NOT NULL
 		 FROM tickets t
 		 JOIN events e ON e.id = t.event_id
 		 WHERE t.serial_no::text = $1 OR t.access_token = $1`,
 		code,
-	).Scan(&ticketID, &serialNo, &eventTitle, &eventHostID, &eventAssignedTo, &ticketType, &checkedInAt, &checkedInChannel)
+	).Scan(&ticketID, &serialNo, &eventTitle, &eventHostID, &eventAssignedTo, &ticketType, &checkedInAt, &checkedInChannel, &voided)
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Ticket not found."})
 	}
@@ -228,6 +248,40 @@ func (h *TicketHandler) CheckIn(c *fiber.Ctx) error {
 	}
 	if ticketType != "Virtual + Location" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "This is a virtual-only ticket — it doesn't need a door check-in."})
+	}
+	if voided {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"error": "This ticket was refunded or cancelled — do not admit.", "used": true, "voided": true,
+			"event_title": eventTitle, "serial_no": serialNo,
+		})
+	}
+
+	// Claim the ticket only if it's still unclaimed (PAY-10). Two scanners,
+	// or a scan racing the stream, can't both admit it: exactly one UPDATE
+	// changes the row.
+	if checkedInChannel == nil {
+		tag, err := h.DB.Exec(context.Background(),
+			`UPDATE tickets SET checked_in_at = NOW(), checked_in_channel = 'physical'
+			 WHERE id = $1 AND checked_in_channel IS NULL AND voided_at IS NULL`,
+			ticketID,
+		)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to record check-in"})
+		}
+		if tag.RowsAffected() == 1 {
+			return c.JSON(fiber.Map{
+				"ok":          true,
+				"used":        false,
+				"event_title": eventTitle,
+				"serial_no":   serialNo,
+			})
+		}
+		// Lost the race: report who won.
+		if err := h.DB.QueryRow(context.Background(),
+			`SELECT checked_in_at, checked_in_channel FROM tickets WHERE id = $1`, ticketID,
+		).Scan(&checkedInAt, &checkedInChannel); err != nil || checkedInChannel == nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to record check-in"})
+		}
 	}
 
 	if checkedInChannel != nil {
@@ -245,19 +299,7 @@ func (h *TicketHandler) CheckIn(c *fiber.Ctx) error {
 		})
 	}
 
-	if _, err := h.DB.Exec(context.Background(),
-		`UPDATE tickets SET checked_in_at = NOW(), checked_in_channel = 'physical' WHERE id = $1`,
-		ticketID,
-	); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to record check-in"})
-	}
-
-	return c.JSON(fiber.Map{
-		"ok":          true,
-		"used":        false,
-		"event_title": eventTitle,
-		"serial_no":   serialNo,
-	})
+	return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to record check-in"})
 }
 
 type guestPurchaseRequest struct {
@@ -265,9 +307,17 @@ type guestPurchaseRequest struct {
 	Email   string `json:"email"`
 }
 
+// feeRule is the commission new ticket orders are sold under (PAY-07).
+func feeRule(cfg *config.Config) services.FeeRule {
+	if cfg == nil {
+		return services.FeeRule{BasisPoints: services.DefaultPlatformFeeBPS}
+	}
+	return services.FeeRule{BasisPoints: cfg.PlatformFeeBPS}
+}
+
 // GuestPurchase allows anyone to buy a ticket with just an email — no account required.
-// If Stripe is configured, returns a checkout URL. If not (dev/bypass), creates the
-// ticket directly and returns the access_token immediately.
+// Free tickets are issued at once; paid tickets go through the host's
+// checkout provider.
 func (h *TicketHandler) GuestPurchase(c *fiber.Ctx) error {
 	var req guestPurchaseRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -277,26 +327,30 @@ func (h *TicketHandler) GuestPurchase(c *fiber.Ctx) error {
 	if req.Email == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "email is required"})
 	}
+	if addr, err := mail.ParseAddress(req.Email); err != nil || addr.Address != req.Email {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "enter a valid email address"})
+	}
 	if req.EventID == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "event_id is required"})
 	}
 
 	var (
 		eventTitle    string
-		ticketPrice   float64
+		priceCents    int64
 		startsAt      time.Time
 		payoutGateway string
 		stripeAccount *string
 		paypalAccount *string
+		stripeReady   bool
 	)
 	err := h.DB.QueryRow(context.Background(),
-		`SELECT e.title, e.ticket_price, e.start_time, COALESCE(ca.payout_gateway, ''),
-		        ca.stripe_account_id, ca.paypal_account_id
+		`SELECT e.title, (e.ticket_price * 100)::bigint, e.start_time, COALESCE(ca.payout_gateway, ''),
+		        ca.stripe_account_id, ca.paypal_account_id, COALESCE(ca.payout_enabled, false)
 		 FROM events e
 		 LEFT JOIN connected_accounts ca ON ca.user_id = e.host_id
 		 WHERE e.id = $1 AND e.venue_paid = true AND e.ends_at > NOW()`,
 		req.EventID,
-	).Scan(&eventTitle, &ticketPrice, &startsAt, &payoutGateway, &stripeAccount, &paypalAccount)
+	).Scan(&eventTitle, &priceCents, &startsAt, &payoutGateway, &stripeAccount, &paypalAccount, &stripeReady)
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "event not found or not available"})
 	}
@@ -305,8 +359,8 @@ func (h *TicketHandler) GuestPurchase(c *fiber.Ctx) error {
 	}
 
 	// Free tickets do not need a configured payment processor.
-	if ticketPrice == 0 {
-		accessToken, claim, err := h.issueFreeTicket(context.Background(), req.EventID, nil, &req.Email)
+	if priceCents == 0 {
+		accessToken, claim, err := h.issueFreeTicket(context.Background(), req.EventID, nil, req.Email)
 		if err != nil {
 			return saleRuleResponse(c, err)
 		}
@@ -322,11 +376,12 @@ func (h *TicketHandler) GuestPurchase(c *fiber.Ctx) error {
 		})
 	}
 
+	sale := paidSale{EventID: req.EventID, Title: eventTitle, PriceCents: priceCents, BuyerEmail: req.Email}
 	if payoutGateway == "paypal" {
 		if paypalAccount == nil || h.PayPal == nil || !h.PayPal.PartnerEnabled() {
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "host PayPal checkout is not available"})
 		}
-		return h.createPayPalTicketCheckout(c, req.EventID, eventTitle, req.Email, nil, *paypalAccount, ticketPrice)
+		return h.createPayPalTicketCheckout(c, sale, *paypalAccount)
 	}
 	if payoutGateway != "stripe" {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "host has not selected a payout account"})
@@ -334,68 +389,10 @@ func (h *TicketHandler) GuestPurchase(c *fiber.Ctx) error {
 	if h.Cfg.StripeSecretKey == "" {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Stripe payment processing is not configured"})
 	}
-
-	// Stripe checkout
-	if stripeAccount == nil {
+	if stripeAccount == nil || !stripeReady {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "host has not completed Stripe onboarding"})
 	}
-	var stripeReady bool
-	_ = h.DB.QueryRow(context.Background(), `SELECT payout_enabled FROM connected_accounts ca JOIN events e ON e.host_id = ca.user_id WHERE e.id = $1`, req.EventID).Scan(&stripeReady)
-	if !stripeReady {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "host has not completed Stripe onboarding"})
-	}
-
-	split := services.CalculateSplit(ticketPrice)
-	stripe.Key = h.Cfg.StripeSecretKey
-	claimToken, claimHash, err := newClaimToken()
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to start checkout"})
-	}
-
-	params := &stripe.CheckoutSessionParams{
-		Mode: stripe.String(string(stripe.CheckoutSessionModePayment)),
-		LineItems: []*stripe.CheckoutSessionLineItemParams{
-			{
-				PriceData: &stripe.CheckoutSessionLineItemPriceDataParams{
-					Currency: stripe.String("usd"),
-					ProductData: &stripe.CheckoutSessionLineItemPriceDataProductDataParams{
-						Name: stripe.String(eventTitle + " — Ticket"),
-					},
-					UnitAmount: stripe.Int64(int64(ticketPrice * 100)),
-				},
-				Quantity: stripe.Int64(1),
-			},
-		},
-		CustomerEmail: stripe.String(req.Email),
-		// Shortest Stripe allows: narrows the gap between "on sale" at
-		// checkout and payment completing.
-		ExpiresAt:  stripe.Int64(time.Now().Add(30 * time.Minute).Unix()),
-		SuccessURL: stripe.String(h.Cfg.FrontendURL + "/ticket-success?claim=" + url.QueryEscape(claimToken)),
-		CancelURL:  stripe.String(h.Cfg.FrontendURL + "/events/" + req.EventID),
-		Metadata: map[string]string{
-			"type":        "ticket",
-			"event_id":    req.EventID,
-			"guest_email": req.Email,
-		},
-	}
-	params.AddExtra("managed_payments[enabled]", "false")
-	params.PaymentIntentData = &stripe.CheckoutSessionPaymentIntentDataParams{
-		ApplicationFeeAmount: stripe.Int64(int64(split.PlatformFee * 100)),
-		TransferData: &stripe.CheckoutSessionPaymentIntentDataTransferDataParams{
-			Destination: stripe.String(*stripeAccount),
-		},
-	}
-
-	s, err := session.New(params)
-	if err != nil {
-		return stripeCheckoutError(c, err)
-	}
-	// The webhook attaches the ticket to this claim once payment completes.
-	if err := insertTicketClaim(context.Background(), h.DB, claimHash, req.EventID, claimTarget{StripeSessionID: &s.ID}); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to start checkout"})
-	}
-
-	return c.JSON(fiber.Map{"checkout_url": s.URL})
+	return h.createStripeTicketCheckout(c, sale, *stripeAccount)
 }
 
 type purchaseRequest struct {
@@ -417,7 +414,7 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 
 	var (
 		eventTitle      string
-		ticketPrice     float64
+		priceCents      int64
 		stripeAccountID *string
 		paypalAccountID *string
 		payoutGateway   string
@@ -425,7 +422,7 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 		buyerEmail      string
 	)
 	err := h.DB.QueryRow(context.Background(),
-		`SELECT e.title, e.ticket_price, ca.stripe_account_id, ca.paypal_account_id,
+		`SELECT e.title, (e.ticket_price * 100)::bigint, ca.stripe_account_id, ca.paypal_account_id,
 		        COALESCE(ca.payout_gateway, ''), ca.payout_enabled, u.email
 		 FROM events e
 		 JOIN connected_accounts ca ON ca.user_id = e.host_id
@@ -433,7 +430,7 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 		 WHERE e.id = $1 AND e.is_active = true AND e.venue_paid = true AND e.ends_at > NOW()
 		   AND ca.payout_gateway IN ('stripe', 'paypal')`,
 		req.EventID, buyerID,
-	).Scan(&eventTitle, &ticketPrice, &stripeAccountID, &paypalAccountID, &payoutGateway, &stripeReady, &buyerEmail)
+	).Scan(&eventTitle, &priceCents, &stripeAccountID, &paypalAccountID, &payoutGateway, &stripeReady, &buyerEmail)
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "event not found, not yet published, or host has not connected a payout account",
@@ -442,19 +439,20 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 	if err := canSellTickets(context.Background(), h.DB, req.EventID, false); err != nil {
 		return saleRuleResponse(c, err)
 	}
-	if ticketPrice == 0 {
-		accessToken, claim, err := h.issueFreeTicket(context.Background(), req.EventID, &buyerID, nil)
+	if priceCents == 0 {
+		accessToken, claim, err := h.issueFreeTicket(context.Background(), req.EventID, &buyerID, buyerEmail)
 		if err != nil {
 			return saleRuleResponse(c, err)
 		}
 		sendTicketEmail(h.DB, h.Email, buyerEmail, accessToken)
 		return c.JSON(fiber.Map{"access_token": accessToken, "event_id": req.EventID, "claim": claim})
 	}
+	sale := paidSale{EventID: req.EventID, Title: eventTitle, PriceCents: priceCents, BuyerID: &buyerID, BuyerEmail: buyerEmail}
 	if payoutGateway == "paypal" {
 		if paypalAccountID == nil || h.PayPal == nil || !h.PayPal.PartnerEnabled() {
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "host PayPal checkout is not available"})
 		}
-		return h.createPayPalTicketCheckout(c, req.EventID, eventTitle, buyerEmail, &buyerID, *paypalAccountID, ticketPrice)
+		return h.createPayPalTicketCheckout(c, sale, *paypalAccountID)
 	}
 	if h.Cfg.StripeSecretKey == "" {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Stripe payment processing is not configured"})
@@ -462,14 +460,48 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 	if stripeAccountID == nil || !stripeReady {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "host has not completed Stripe onboarding"})
 	}
+	return h.createStripeTicketCheckout(c, sale, *stripeAccountID)
+}
 
-	split := services.CalculateSplit(ticketPrice)
+// paidSale is one paid ticket about to go to checkout.
+type paidSale struct {
+	EventID    string
+	Title      string
+	PriceCents int64
+	BuyerID    *string
+	BuyerEmail string
+}
+
+func (h *TicketHandler) pendingTicketOrder(ctx context.Context, s paidSale, provider string) (*order, error) {
+	return createPendingOrder(ctx, h.DB, newOrder{
+		Kind: "ticket", EventID: s.EventID, BuyerID: s.BuyerID, BuyerEmail: s.BuyerEmail,
+		Quantity: 1, UnitCents: s.PriceCents, Fee: feeRule(h.Cfg), Provider: provider,
+		Reserve: true, PerBuyerLimit: h.Cfg.TicketsPerBuyer(),
+	})
+}
+
+// createStripeTicketCheckout reserves the ticket in a pending order, then
+// opens a Stripe Checkout for exactly that order: the charge, the platform
+// fee and the host's destination transfer all come from the order's cents.
+func (h *TicketHandler) createStripeTicketCheckout(c *fiber.Ctx, s paidSale, destination string) error {
+	ctx := context.Background()
+	o, err := h.pendingTicketOrder(ctx, s, "stripe")
+	if err != nil {
+		return saleRuleResponse(c, err)
+	}
 	stripe.Key = h.Cfg.StripeSecretKey
 	claimToken, claimHash, err := newClaimToken()
 	if err != nil {
+		_ = endPendingOrder(ctx, h.DB, o.ID, "failed", "checkout could not be created")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to start checkout"})
 	}
 
+	metadata := map[string]string{"type": "ticket", "event_id": s.EventID, "order_id": o.ID}
+	if s.BuyerID != nil {
+		metadata["buyer_id"] = *s.BuyerID
+	} else {
+		metadata["guest_email"] = s.BuyerEmail
+	}
 	params := &stripe.CheckoutSessionParams{
 		Mode: stripe.String(string(stripe.CheckoutSessionModePayment)),
 		LineItems: []*stripe.CheckoutSessionLineItemParams{
@@ -477,74 +509,93 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 				PriceData: &stripe.CheckoutSessionLineItemPriceDataParams{
 					Currency: stripe.String("usd"),
 					ProductData: &stripe.CheckoutSessionLineItemPriceDataProductDataParams{
-						Name: stripe.String(eventTitle + " — Ticket"),
+						Name: stripe.String(s.Title + " — Ticket"),
 					},
-					UnitAmount: stripe.Int64(int64(ticketPrice * 100)),
+					UnitAmount: stripe.Int64(o.UnitAmountCents),
 				},
-				Quantity: stripe.Int64(1),
+				Quantity: stripe.Int64(int64(o.Quantity)),
 			},
 		},
-		CustomerEmail: stripe.String(buyerEmail),
-		ExpiresAt:     stripe.Int64(time.Now().Add(30 * time.Minute).Unix()),
-		SuccessURL:    stripe.String(h.Cfg.FrontendURL + "/ticket-success?claim=" + url.QueryEscape(claimToken)),
-		CancelURL:     stripe.String(h.Cfg.FrontendURL + "/events/" + req.EventID),
-		Metadata: map[string]string{
-			"type":     "ticket",
-			"event_id": req.EventID,
-			"buyer_id": buyerID,
-		},
+		ClientReferenceID: stripe.String(o.ID),
+		CustomerEmail:     stripe.String(s.BuyerEmail),
+		// Shortest Stripe allows: narrows the gap between "on sale" at
+		// checkout and payment completing. The order's reservation outlasts it.
+		ExpiresAt:  stripe.Int64(time.Now().Add(30 * time.Minute).Unix()),
+		SuccessURL: stripe.String(h.Cfg.FrontendURL + "/ticket-success?claim=" + url.QueryEscape(claimToken)),
+		CancelURL:  stripe.String(h.Cfg.FrontendURL + "/events/" + s.EventID),
+		Metadata:   metadata,
 	}
 	params.AddExtra("managed_payments[enabled]", "false")
 	params.PaymentIntentData = &stripe.CheckoutSessionPaymentIntentDataParams{
-		ApplicationFeeAmount: stripe.Int64(int64(split.PlatformFee * 100)),
+		// Refunds and disputes carry the PaymentIntent's metadata, which
+		// is how they're matched to the order.
+		Metadata: map[string]string{"order_id": o.ID, "event_id": s.EventID},
 		TransferData: &stripe.CheckoutSessionPaymentIntentDataTransferDataParams{
-			Destination: stripe.String(*stripeAccountID),
+			Destination: stripe.String(destination),
 		},
 	}
+	if o.PlatformFeeCents > 0 {
+		params.PaymentIntentData.ApplicationFeeAmount = stripe.Int64(o.PlatformFeeCents)
+	}
+	params.SetIdempotencyKey("checkout-" + o.ID)
 
-	s, err := session.New(params)
+	sess, err := session.New(params)
 	if err != nil {
+		_ = endPendingOrder(ctx, h.DB, o.ID, "failed", "checkout could not be created")
 		return stripeCheckoutError(c, err)
 	}
+	if err := setOrderCheckout(ctx, h.DB, o.ID, sess.ID); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to start checkout"})
+	}
 	// The webhook attaches the ticket to this claim once payment completes.
-	if err := insertTicketClaim(context.Background(), h.DB, claimHash, req.EventID, claimTarget{StripeSessionID: &s.ID}); err != nil {
+	if err := insertTicketClaim(ctx, h.DB, claimHash, s.EventID, claimTarget{StripeSessionID: &sess.ID}); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to start checkout"})
 	}
 
-	return c.JSON(fiber.Map{"checkout_url": s.URL})
+	return c.JSON(fiber.Map{"checkout_url": sess.URL})
 }
 
-func (h *TicketHandler) createPayPalTicketCheckout(c *fiber.Ctx, eventID, eventTitle, buyerEmail string, buyerID *string, merchantID string, amount float64) error {
+func (h *TicketHandler) createPayPalTicketCheckout(c *fiber.Ctx, s paidSale, merchantID string) error {
+	ctx := context.Background()
+	o, err := h.pendingTicketOrder(ctx, s, "paypal")
+	if err != nil {
+		return saleRuleResponse(c, err)
+	}
 	claimToken, claimHash, err := newClaimToken()
 	if err != nil {
+		_ = endPendingOrder(ctx, h.DB, o.ID, "failed", "checkout could not be created")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to start checkout"})
 	}
 	// PayPal appends &token=<order id>; the claim rides along so the return
 	// page can show this purchase's ticket without any email in the URL.
 	returnURL := strings.TrimRight(c.BaseURL(), "/") + "/api/v1/tickets/paypal/complete?claim=" + url.QueryEscape(claimToken)
-	split := services.CalculateSplit(amount)
-	order, err := h.PayPal.CreateCheckoutOrder(services.CheckoutOrderRequest{
-		Amount: amount, Description: eventTitle + " — Ticket", Reference: "ticket-" + eventID,
-		ReturnURL: returnURL, CancelURL: h.Cfg.FrontendURL + "/events/" + eventID,
-		PayeeMerchantID: merchantID, PlatformFee: split.PlatformFee,
+	ppOrder, err := h.PayPal.CreateCheckoutOrder(services.CheckoutOrderRequest{
+		AmountCents: o.AmountCents, Description: s.Title + " — Ticket", Reference: "ticket-" + s.EventID,
+		ReturnURL: returnURL, CancelURL: h.Cfg.FrontendURL + "/events/" + s.EventID,
+		PayeeMerchantID: merchantID, PlatformFeeCents: o.PlatformFeeCents, CustomID: o.ID,
 	})
 	if err != nil {
 		fmt.Printf("paypal ticket checkout error: %v\n", err)
+		_ = endPendingOrder(ctx, h.DB, o.ID, "failed", "checkout could not be created")
 		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "PayPal could not create checkout"})
 	}
-	if _, err := h.DB.Exec(context.Background(),
-		`INSERT INTO paypal_ticket_orders (order_id, event_id, buyer_id, buyer_email, amount, merchant_id)
-		 VALUES ($1,$2,$3,$4,$5,$6)`, order.ID, eventID, buyerID, buyerEmail, amount, merchantID); err != nil {
+	if _, err := h.DB.Exec(ctx,
+		`INSERT INTO paypal_ticket_orders (order_id, event_id, buyer_id, buyer_email, amount, merchant_id, app_order_id)
+		 VALUES ($1, $2, $3, $4, ($5::bigint)::numeric / 100, $6, $7)`,
+		ppOrder.ID, s.EventID, s.BuyerID, s.BuyerEmail, o.AmountCents, merchantID, o.ID); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save PayPal checkout"})
 	}
-	if err := insertTicketClaim(context.Background(), h.DB, claimHash, eventID, claimTarget{PayPalOrderID: &order.ID}); err != nil {
+	if err := setOrderCheckout(ctx, h.DB, o.ID, ppOrder.ID); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save PayPal checkout"})
 	}
-	return c.JSON(fiber.Map{"checkout_provider": "paypal", "checkout_url": order.ApprovalURL})
+	if err := insertTicketClaim(ctx, h.DB, claimHash, s.EventID, claimTarget{PayPalOrderID: &ppOrder.ID}); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save PayPal checkout"})
+	}
+	return c.JSON(fiber.Map{"checkout_provider": "paypal", "checkout_url": ppOrder.ApprovalURL})
 }
 
 // PayPalComplete captures an approved ticket order and creates exactly one
-// ticket/ledger pair for it. Order details come only from the server-side row.
+// ticket for it. Order details come only from the server-side row.
 func (h *TicketHandler) PayPalComplete(c *fiber.Ctx) error {
 	orderID := strings.TrimSpace(c.Query("token"))
 	redirect := h.Cfg.FrontendURL + "/ticket-success"
@@ -566,112 +617,126 @@ func (h *TicketHandler) PayPalComplete(c *fiber.Ctx) error {
 	return c.Redirect(redirect)
 }
 
-// PayPalWebhook is the fallback for buyers who approve payment and close the
-// PayPal window before the browser return reaches PayPalComplete. PayPal signs
-// the event, and its verification API validates that signature before we act.
-func (h *TicketHandler) PayPalWebhook(c *fiber.Ctx) error {
-	if h.PayPal == nil {
-		return c.SendStatus(fiber.StatusServiceUnavailable)
+// paypalCaptureMatches checks PayPal took exactly this order's money, in
+// USD, for this event, into the host's account (PAY-04).
+func paypalCaptureMatches(captured *services.CapturedOrder, o *order, merchantID string) error {
+	switch {
+	case captured == nil:
+		return errors.New("no capture details")
+	case captured.Currency != "USD":
+		return fmt.Errorf("captured in %q, not USD", captured.Currency)
+	case captured.AmountCents != o.AmountCents:
+		return fmt.Errorf("captured %d cents for an order of %d cents", captured.AmountCents, o.AmountCents)
+	case captured.Reference != "ticket-"+o.EventID:
+		return fmt.Errorf("capture reference %q is not this event", captured.Reference)
+	case captured.PayeeMerchantID != merchantID:
+		return errors.New("captured into a different PayPal account")
+	case captured.CaptureID == "":
+		return errors.New("capture has no ID")
 	}
-	raw := append([]byte(nil), c.Body()...)
-	var event struct {
-		ID           string          `json:"id"`
-		EventType    string          `json:"event_type"`
-		Resource     json.RawMessage `json:"resource"`
-		ResourceType string          `json:"resource_type"`
-	}
-	if err := json.Unmarshal(raw, &event); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid PayPal webhook"})
-	}
-	verified, err := h.PayPal.VerifyWebhookSignature(
-		c.Get("PayPal-Transmission-Id"),
-		c.Get("PayPal-Transmission-Time"),
-		c.Get("PayPal-Cert-Url"),
-		c.Get("PayPal-Auth-Algo"),
-		c.Get("PayPal-Transmission-Sig"),
-		json.RawMessage(raw),
-	)
-	if err != nil {
-		fmt.Printf("paypal webhook verification error: %v\n", err)
-		return c.SendStatus(fiber.StatusBadGateway)
-	}
-	if !verified {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid PayPal webhook signature"})
-	}
-
-	if event.EventType == "CHECKOUT.ORDER.APPROVED" {
-		var resource struct {
-			ID string `json:"id"`
-		}
-		if err := json.Unmarshal(event.Resource, &resource); err != nil || resource.ID == "" {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "PayPal order ID is missing"})
-		}
-		if _, _, err := h.completePayPalTicketOrder(context.Background(), resource.ID); err != nil {
-			fmt.Printf("paypal webhook order completion error: event=%s order=%s error=%v\n", event.ID, resource.ID, err)
-			// A non-2xx response asks PayPal to retry a transient failure.
-			return c.SendStatus(fiber.StatusInternalServerError)
-		}
-	}
-	return c.SendStatus(fiber.StatusOK)
+	return nil
 }
 
 // completePayPalTicketOrder captures and fulfils one locally-created PayPal
-// order. The row lock makes browser returns and webhook retries converge on
-// exactly one ticket and ledger entry.
-func (h *TicketHandler) completePayPalTicketOrder(ctx context.Context, orderID string) (buyerEmail string, alreadyCompleted bool, resultErr error) {
+// order. The row locks make browser returns and webhook retries converge on
+// exactly one capture, one ticket and one set of journals.
+func (h *TicketHandler) completePayPalTicketOrder(ctx context.Context, paypalOrderID string) (buyerEmail string, alreadyCompleted bool, resultErr error) {
 	tx, err := h.DB.Begin(ctx)
 	if err != nil {
 		return "", false, err
 	}
 	defer tx.Rollback(ctx)
-	var eventID, status, merchantID string
-	var buyerID *string
-	var amount float64
+	var (
+		eventID, status, merchantID string
+		buyerID, orderID            *string
+		amount                      float64
+	)
 	if err := tx.QueryRow(ctx,
-		`SELECT event_id, buyer_id, buyer_email, amount, status, merchant_id
-		 FROM paypal_ticket_orders WHERE order_id = $1 FOR UPDATE`, orderID,
-	).Scan(&eventID, &buyerID, &buyerEmail, &amount, &status, &merchantID); err != nil {
+		`SELECT event_id, buyer_id, buyer_email, amount::float8, status, merchant_id, app_order_id::text
+		 FROM paypal_ticket_orders WHERE order_id = $1 FOR UPDATE`, paypalOrderID,
+	).Scan(&eventID, &buyerID, &buyerEmail, &amount, &status, &merchantID, &orderID); err != nil {
 		return "", false, err
 	}
 	if status == "completed" {
 		return buyerEmail, true, nil
 	}
+
+	var o *order
+	if orderID != nil {
+		if o, err = lockOrder(ctx, tx, `id = $1`, *orderID); err != nil {
+			return buyerEmail, false, err
+		}
+	}
+	if o == nil {
+		// A checkout started by the previous release: record it as an order.
+		cents, cerr := services.DollarsToCents(amount)
+		if cerr != nil {
+			return buyerEmail, false, cerr
+		}
+		if o, err = insertOrder(ctx, tx, newOrder{
+			Kind: "ticket", EventID: eventID, BuyerID: buyerID, BuyerEmail: buyerEmail, Quantity: 1,
+			UnitCents: cents, Fee: feeRule(h.Cfg), Provider: "paypal", Adopt: true, CheckoutID: paypalOrderID,
+		}, "pending"); err != nil {
+			return buyerEmail, false, err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE paypal_ticket_orders SET app_order_id = $2 WHERE order_id = $1`, paypalOrderID, o.ID); err != nil {
+			return buyerEmail, false, err
+		}
+	}
+	if o.Status == "paid" || o.Status == "needs_attention" {
+		return buyerEmail, true, nil
+	}
+
 	// Re-check the sales rule before taking the money: if the event was
 	// cancelled, disabled, ended or sold out since checkout started, the
 	// order is never captured and the buyer isn't charged.
-	if err := canSellTickets(ctx, tx, eventID, true); err != nil {
+	if err := checkSale(ctx, tx, eventID, saleCheck{Lock: true, Quantity: o.Quantity, ExcludeOrder: &o.ID}); err != nil {
+		if isSaleRuleError(err) {
+			if eerr := endPendingOrder(ctx, tx, o.ID, "failed", err.Error()); eerr == nil {
+				_ = tx.Commit(ctx)
+			}
+		}
 		return buyerEmail, false, err
 	}
-	if err := h.PayPal.CaptureCheckoutOrder(orderID, merchantID); err != nil {
-		return buyerEmail, false, err
-	}
-
-	var ticketID, accessToken string
-	accessToken = services.GenerateTicketCode()
-	if buyerID != nil {
-		err = tx.QueryRow(ctx, `INSERT INTO tickets (event_id,buyer_id,access_token) VALUES ($1,$2,$3) RETURNING id`, eventID, *buyerID, accessToken).Scan(&ticketID)
-	} else {
-		err = tx.QueryRow(ctx, `INSERT INTO tickets (event_id,buyer_id,guest_email,access_token) VALUES ($1,NULL,$2,$3) RETURNING id`, eventID, buyerEmail, accessToken).Scan(&ticketID)
-	}
+	captured, err := h.PayPal.CaptureOrder(paypalOrderID, merchantID)
 	if err != nil {
 		return buyerEmail, false, err
 	}
-	split := services.CalculateSplit(amount)
-	if _, err = tx.Exec(ctx,
-		`INSERT INTO ledger_entries (ticket_id,event_id,gross_amount,stripe_fee,platform_fee,host_payout,payout_gateway,payout_status)
-		 VALUES ($1,$2,$3,0,$4,$5,'paypal','paid')`, ticketID, eventID, amount, split.PlatformFee, split.HostShare()); err != nil {
+	if mismatch := paypalCaptureMatches(captured, o, merchantID); mismatch != nil {
+		reason := "PayPal capture doesn't match the order (" + mismatch.Error() + "); not booked"
+		if err := markNeedsAttention(ctx, tx, o, reason); err != nil {
+			return buyerEmail, false, err
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE orders SET provider_payment_id = NULLIF($2, '') WHERE id = $1`, o.ID, captured.CaptureID); err != nil {
+			return buyerEmail, false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return buyerEmail, false, err
+		}
+		return buyerEmail, false, needsAttention("PayPal order %s: %s", paypalOrderID, reason)
+	}
+
+	codes, err := markOrderPaid(ctx, tx, o, fulfillment{CheckoutID: paypalOrderID, PaymentID: captured.CaptureID}, nil)
+	if err != nil {
 		return buyerEmail, false, err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE ticket_claims SET ticket_id = $1 WHERE paypal_order_id = $2`, ticketID, orderID); err != nil {
+	ticketID, err := firstTicketID(ctx, tx, o.ID)
+	if err != nil {
 		return buyerEmail, false, err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE paypal_ticket_orders SET status='completed', ticket_id=$2, completed_at=NOW() WHERE order_id=$1 AND status='created'`, orderID, ticketID); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE ticket_claims SET ticket_id = $1 WHERE paypal_order_id = $2`, ticketID, paypalOrderID); err != nil {
+		return buyerEmail, false, err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE paypal_ticket_orders SET status='completed', ticket_id=$2, completed_at=NOW() WHERE order_id=$1 AND status='created'`, paypalOrderID, ticketID); err != nil {
 		return buyerEmail, false, err
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return buyerEmail, false, err
 	}
-	sendTicketEmail(h.DB, h.Email, buyerEmail, accessToken)
+	for _, code := range codes {
+		sendTicketEmail(h.DB, h.Email, buyerEmail, code)
+	}
 	return buyerEmail, false, nil
 }
 

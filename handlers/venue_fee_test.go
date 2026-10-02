@@ -37,33 +37,38 @@ func TestVenueFeeStripeSessionMatches(t *testing.T) {
 		{"no session", nil, false},
 	}
 	for _, tc := range cases {
-		if got := venueFeeStripeSessionMatches(tc.sess, event, 45); got != tc.want {
+		if got := venueFeeStripeSessionMatches(tc.sess, event, 4500); got != tc.want {
 			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }
 
-func TestVenueFeePaymentMatches(t *testing.T) {
+// PAY-04: a PayPal capture is only accepted when PayPal took exactly the
+// order's amount, in USD, for this event, into the host's account.
+func TestPayPalCaptureMatches(t *testing.T) {
 	const event = "6b34a2a3-0b11-467d-a9b2-0569fc99a147"
-	ok := &services.CapturedOrder{Reference: "venue-fee-" + event, Currency: "USD", Amount: 30}
+	o := &order{ID: "o1", EventID: event, AmountCents: 2500}
+	ok := services.CapturedOrder{Reference: "ticket-" + event, Currency: "USD", AmountCents: 2500,
+		PayeeMerchantID: "HOSTMERCHANT", CaptureID: "CAP1"}
+	with := func(f func(*services.CapturedOrder)) *services.CapturedOrder { c := ok; f(&c); return &c }
 
-	cases := []struct {
-		name     string
+	cases := map[string]struct {
 		captured *services.CapturedOrder
-		fee      float64
 		want     bool
 	}{
-		{"exact payment", ok, 30, true},
-		{"float rounding", &services.CapturedOrder{Reference: ok.Reference, Currency: "USD", Amount: 29.999999}, 30, true},
-		{"order for another event", &services.CapturedOrder{Reference: "venue-fee-other", Currency: "USD", Amount: 30}, 30, false},
-		{"cheaper order", &services.CapturedOrder{Reference: ok.Reference, Currency: "USD", Amount: 15}, 30, false},
-		{"wrong currency", &services.CapturedOrder{Reference: ok.Reference, Currency: "JMD", Amount: 30}, 30, false},
-		{"ticket order reused", &services.CapturedOrder{Reference: "ticket-" + event, Currency: "USD", Amount: 30}, 30, false},
-		{"nothing captured", nil, 30, false},
+		"exact payment":        {&ok, true},
+		"a cent short":         {with(func(c *services.CapturedOrder) { c.AmountCents = 2499 }), false},
+		"more than the order":  {with(func(c *services.CapturedOrder) { c.AmountCents = 2600 }), false},
+		"wrong currency":       {with(func(c *services.CapturedOrder) { c.Currency = "JMD" }), false},
+		"another event":        {with(func(c *services.CapturedOrder) { c.Reference = "ticket-other" }), false},
+		"booking fee reused":   {with(func(c *services.CapturedOrder) { c.Reference = "venue-fee-" + event }), false},
+		"paid to someone else": {with(func(c *services.CapturedOrder) { c.PayeeMerchantID = "ATTACKER" }), false},
+		"no capture ID":        {with(func(c *services.CapturedOrder) { c.CaptureID = "" }), false},
+		"nothing captured":     {nil, false},
 	}
-	for _, tc := range cases {
-		if got := venueFeePaymentMatches(tc.captured, event, tc.fee); got != tc.want {
-			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+	for name, tc := range cases {
+		if err := paypalCaptureMatches(tc.captured, o, "HOSTMERCHANT"); (err == nil) != tc.want {
+			t.Errorf("%s: got %v, want match=%v", name, err, tc.want)
 		}
 	}
 }

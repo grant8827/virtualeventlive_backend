@@ -181,111 +181,57 @@ func (h *PayoutHandler) CompletePayPal(c *fiber.Ctx) error {
 	return c.Redirect(h.Cfg.FrontendURL + "/dashboard/payouts?paypal_connected=1")
 }
 
-// Balance sums ledger entries not yet paid out to the host.
+// Balance is what the platform still owes the host: their share of sales
+// that were not paid to them at checkout, net of refunds, from the ledger.
+// Stripe and PayPal hosts are paid at checkout, so theirs is normally zero.
 func (h *PayoutHandler) Balance(c *fiber.Ctx) error {
 	hostID, ok := c.Locals("user_id").(string)
 	if !ok || hostID == "" {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
 	}
 
-	var pending float64
 	var gateway string
 	_ = h.DB.QueryRow(context.Background(),
 		`SELECT COALESCE(payout_gateway, 'stripe') FROM connected_accounts WHERE user_id = $1`, hostID,
 	).Scan(&gateway)
 
-	_ = h.DB.QueryRow(context.Background(),
-		`SELECT COALESCE(SUM(le.host_payout), 0)
-		 FROM ledger_entries le
-		 JOIN events e ON e.id = le.event_id
-		 WHERE e.host_id = $1 AND le.payout_status = 'pending' AND le.payout_gateway = $2`,
-		hostID, gateway,
-	).Scan(&pending)
+	var owedCents int64
+	if err := h.DB.QueryRow(context.Background(),
+		`SELECT COALESCE(-SUM(p.amount_cents), 0)
+		 FROM ledger_postings p JOIN ledger_journal j ON j.id = p.journal_id
+		 WHERE j.host_id = $1 AND p.account = 'host_payable'`, hostID,
+	).Scan(&owedCents); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to load balance"})
+	}
 
 	return c.JSON(fiber.Map{
-		"pending_amount": pending,
+		"pending_amount": services.CentsToDollars(owedCents),
+		"pending_cents":  owedCents,
 		"gateway":        gateway,
 		"currency":       "USD",
 	})
 }
 
-// Payout sends a pending balance through a manual payout rail. Stripe and
-// PayPal Commerce Platform hosts are paid automatically during checkout.
+// Payout used to send a pending balance through WiPay. WiPay's payout API
+// was never verified end to end, so it is disabled (PAY-08): nothing is sent
+// and nothing is marked paid. Stripe and PayPal hosts are paid at checkout.
+// Any balance still owed is paid by the platform manually and recorded then.
 func (h *PayoutHandler) Payout(c *fiber.Ctx) error {
 	hostID, ok := c.Locals("user_id").(string)
 	if !ok || hostID == "" {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
 	}
-
-	ctx := context.Background()
-	tx, err := h.DB.Begin(ctx)
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to start payout"})
-	}
-	defer tx.Rollback(ctx)
-	// Serialize payouts per host. Without this lock two quick requests could
-	// submit the same pending balance twice to an external payout provider.
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, hostID); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to lock payout"})
-	}
-
-	var gateway string
-	var wipayAccountID *string
-	err = tx.QueryRow(ctx,
-		`SELECT payout_gateway, wipay_account_id FROM connected_accounts WHERE user_id = $1`, hostID,
-	).Scan(&gateway, &wipayAccountID)
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "no payout account connected"})
-	}
-	if gateway == "stripe" {
+	var gateway *string
+	_ = h.DB.QueryRow(context.Background(),
+		`SELECT payout_gateway FROM connected_accounts WHERE user_id = $1`, hostID,
+	).Scan(&gateway)
+	switch {
+	case gateway != nil && *gateway == "stripe":
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Stripe payouts happen automatically — nothing to trigger"})
-	}
-	if gateway == "paypal" {
+	case gateway != nil && *gateway == "paypal":
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "PayPal splits and disburses ticket revenue automatically — nothing to trigger"})
 	}
-
-	var pending float64
-	if err := tx.QueryRow(ctx,
-		`SELECT COALESCE(SUM(le.host_payout), 0)
-		 FROM ledger_entries le
-		 JOIN events e ON e.id = le.event_id
-		 WHERE e.host_id = $1 AND le.payout_status = 'pending' AND le.payout_gateway = $2`,
-		hostID, gateway,
-	).Scan(&pending); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to calculate balance"})
-	}
-	if pending <= 0 {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "no pending balance to pay out"})
-	}
-
-	var transactionRef string
-	switch gateway {
-	case "wipay":
-		if wipayAccountID == nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "no WiPay account connected"})
-		}
-		ref, err := h.WiPay.SendPayout(*wipayAccountID, pending, "")
-		if err != nil {
-			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": err.Error()})
-		}
-		transactionRef = ref
-	default:
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "unknown payout gateway"})
-	}
-
-	if _, err := tx.Exec(ctx,
-		`UPDATE ledger_entries le SET payout_status = 'paid', payout_gateway = $2, paid_out_at = NOW()
-		 FROM events e
-		 WHERE le.event_id = e.id AND e.host_id = $1 AND le.payout_status = 'pending'
-		   AND le.payout_gateway = $2`,
-		hostID, gateway,
-	); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "payout sent but failed to update ledger — contact support"})
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "payout sent but failed to finalize ledger — contact support"})
-	}
-	auditPayoutEvent(h.DB, c, hostID, "payout_sent_"+gateway)
-
-	return c.JSON(fiber.Map{"paid": true, "amount": pending, "gateway": gateway, "reference": transactionRef})
+	return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+		"error": "Manual payouts aren't available yet. Contact support to be paid any balance owed.",
+	})
 }

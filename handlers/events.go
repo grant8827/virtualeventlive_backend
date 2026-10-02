@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math"
@@ -120,7 +121,11 @@ func (h *EventHandler) Create(c *fiber.Ctx) error {
 // Pricing is public: the site shows the venue rate from here rather than
 // hard-coding it, so changing HOURLY_RATE updates every page.
 func (h *EventHandler) Pricing(c *fiber.Ctx) error {
-	return c.JSON(fiber.Map{"hourly_rate": h.Cfg.HourlyRate})
+	return c.JSON(fiber.Map{
+		"hourly_rate": h.Cfg.HourlyRate,
+		// Shown on the ticket setup page before anything is sold (PAY-07).
+		"platform_fee_bps": h.Cfg.PlatformFeeBPS,
+	})
 }
 
 func (h *EventHandler) Checkout(c *fiber.Ctx) error {
@@ -129,14 +134,17 @@ func (h *EventHandler) Checkout(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
 	}
 	eventID := c.Params("id")
-	var title string
-	var venueFee float64
-	var venuePaid bool
-
+	var (
+		title     string
+		feeCents  int64
+		venuePaid bool
+		hostEmail string
+	)
 	err := h.DB.QueryRow(context.Background(),
-		`SELECT title, venue_fee, venue_paid FROM events WHERE id = $1 AND host_id = $2`,
+		`SELECT e.title, (e.venue_fee * 100)::bigint, e.venue_paid, u.email
+		 FROM events e JOIN users u ON u.id = e.host_id WHERE e.id = $1 AND e.host_id = $2`,
 		eventID, hostID,
-	).Scan(&title, &venueFee, &venuePaid)
+	).Scan(&title, &feeCents, &venuePaid, &hostEmail)
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "event not found"})
 	}
@@ -151,6 +159,15 @@ func (h *EventHandler) Checkout(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Stripe event booking checkout is not configured"})
 	}
 
+	ctx := context.Background()
+	o, err := createPendingOrder(ctx, h.DB, newOrder{
+		Kind: "booking_fee", EventID: eventID, BuyerID: &hostID, BuyerEmail: hostEmail,
+		Quantity: 1, UnitCents: feeCents, Provider: "stripe",
+	})
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to create checkout session"})
+	}
+
 	stripe.Key = h.Cfg.StripeSecretKey
 
 	// The host comes back through the backend, which confirms the payment
@@ -159,6 +176,12 @@ func (h *EventHandler) Checkout(c *fiber.Ctx) error {
 	returnURL := fmt.Sprintf("%s/api/v1/events/%s/stripe/complete?session_id={CHECKOUT_SESSION_ID}",
 		strings.TrimRight(c.BaseURL(), "/"), url.PathEscape(eventID))
 
+	metadata := map[string]string{
+		"type":     "venue_fee",
+		"event_id": eventID,
+		"host_id":  hostID,
+		"order_id": o.ID,
+	}
 	params := &stripe.CheckoutSessionParams{
 		Mode: stripe.String(string(stripe.CheckoutSessionModePayment)),
 		LineItems: []*stripe.CheckoutSessionLineItemParams{
@@ -169,27 +192,30 @@ func (h *EventHandler) Checkout(c *fiber.Ctx) error {
 						Name:        stripe.String("Event booking platform fee — " + title),
 						Description: stripe.String("Virtual Event Plus event booking and activation fee"),
 					},
-					UnitAmount: stripe.Int64(int64(math.Round(venueFee * 100))),
+					UnitAmount: stripe.Int64(o.UnitAmountCents),
 				},
 				Quantity: stripe.Int64(1),
 			},
 		},
-		SuccessURL: stripe.String(returnURL),
-		CancelURL:  stripe.String(h.Cfg.FrontendURL + "/dashboard?venue_paid=0"),
-		Metadata: map[string]string{
-			"type":     "venue_fee",
-			"event_id": eventID,
-			"host_id":  hostID,
-		},
+		ClientReferenceID: stripe.String(o.ID),
+		SuccessURL:        stripe.String(returnURL),
+		CancelURL:         stripe.String(h.Cfg.FrontendURL + "/dashboard?venue_paid=0"),
+		Metadata:          metadata,
+		PaymentIntentData: &stripe.CheckoutSessionPaymentIntentDataParams{Metadata: metadata},
 	}
 	// The platform uses standard Checkout. Stripe enables Managed Payments by
 	// default on this account, but that product requires tax codes for every
 	// inline product. stripe-go v82 predates this typed field, so pass Stripe's
 	// documented opt-out as an extra parameter.
 	params.AddExtra("managed_payments[enabled]", "false")
+	params.SetIdempotencyKey("checkout-" + o.ID)
 
 	s, err := session.New(params)
 	if err != nil {
+		_ = endPendingOrder(ctx, h.DB, o.ID, "failed", "checkout session could not be created")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to create checkout session"})
+	}
+	if err := setOrderCheckout(ctx, h.DB, o.ID, s.ID); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to create checkout session"})
 	}
 
@@ -297,46 +323,18 @@ func (h *EventHandler) WiPayComplete(c *fiber.Ctx) error {
 	return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=1")
 }
 
+// PayPalComplete was the return route for PayPal booking-fee payments.
+// Booking fees are Stripe-only and nothing creates PayPal booking-fee orders
+// any more, so the route is retired (PAY-08): it never captures a payment
+// and never activates an event.
 func (h *EventHandler) PayPalComplete(c *fiber.Ctx) error {
-	eventID := c.Params("id")
-	state := c.Query("state")
-	orderID := c.Query("token")
-	if state == "" || orderID == "" {
-		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
-	}
-
-	var hostID string
-	var venueFee float64
-	if err := h.DB.QueryRow(context.Background(), `SELECT host_id, venue_fee FROM events WHERE id = $1`, eventID).Scan(&hostID, &venueFee); err != nil {
-		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
-	}
-	if err := h.verifyVenueFeeState(state, eventID, hostID, venueFee); err != nil {
-		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
-	}
-	if h.PayPal == nil {
-		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
-	}
-	captured, err := h.PayPal.CaptureOrder(orderID)
-	if err != nil {
-		log.Printf("venue fee: PayPal capture failed for event %s: %v", eventID, err)
-		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
-	}
-	// The order ID comes from the return URL, so confirm PayPal took payment
-	// for this event's fee — not a cheaper order made for another event.
-	if !venueFeePaymentMatches(captured, eventID, venueFee) {
-		log.Printf("venue fee: PayPal order %s does not match event %s (paid %s %.2f for %q, expected USD %.2f)",
-			orderID, eventID, captured.Currency, captured.Amount, captured.Reference, venueFee)
-		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
-	}
-	if err := activateVenuePaidEvent(context.Background(), h.DB, h.IVS, eventID); err != nil {
-		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
-	}
-	return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=1")
+	return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
 }
 
 // StripeComplete is where Stripe sends the host after paying the booking
 // fee. The session ID comes from the URL, so the payment is re-read from
-// Stripe and checked before the event is activated.
+// Stripe and checked before the event is activated and the fee is booked —
+// the same steps, and the same idempotency, as the webhook.
 func (h *EventHandler) StripeComplete(c *fiber.Ctx) error {
 	eventID := c.Params("id")
 	fail := func() error { return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0") }
@@ -345,24 +343,18 @@ func (h *EventHandler) StripeComplete(c *fiber.Ctx) error {
 	if sessionID == "" || h.Cfg.StripeSecretKey == "" {
 		return fail()
 	}
-	var venueFee float64
-	if err := h.DB.QueryRow(context.Background(),
-		`SELECT venue_fee FROM events WHERE id = $1`, eventID,
-	).Scan(&venueFee); err != nil {
-		return fail()
-	}
-
 	stripe.Key = h.Cfg.StripeSecretKey
 	sess, err := session.Get(sessionID, nil)
 	if err != nil {
 		log.Printf("venue fee: Stripe session %s lookup failed: %v", sessionID, err)
 		return fail()
 	}
-	if !venueFeeStripeSessionMatches(sess, eventID, venueFee) {
+	if sess.Metadata["event_id"] != eventID {
 		log.Printf("venue fee: Stripe session %s does not match event %s", sessionID, eventID)
 		return fail()
 	}
-	if err := activateVenuePaidEvent(context.Background(), h.DB, h.IVS, eventID); err != nil {
+	if err := recordBookingFee(context.Background(), h.DB, h.IVS, sess); err != nil {
+		log.Printf("venue fee: session %s for event %s not recorded: %v", sessionID, eventID, err)
 		return fail()
 	}
 	return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=1")
@@ -370,22 +362,13 @@ func (h *EventHandler) StripeComplete(c *fiber.Ctx) error {
 
 // venueFeeStripeSessionMatches checks a Stripe Checkout session is a paid
 // booking fee for this event, for the full amount in USD.
-func venueFeeStripeSessionMatches(sess *stripe.CheckoutSession, eventID string, venueFee float64) bool {
+func venueFeeStripeSessionMatches(sess *stripe.CheckoutSession, eventID string, feeCents int64) bool {
 	return sess != nil &&
 		sess.Metadata["type"] == "venue_fee" &&
 		sess.Metadata["event_id"] == eventID &&
 		sess.PaymentStatus == stripe.CheckoutSessionPaymentStatusPaid &&
 		strings.EqualFold(string(sess.Currency), "usd") &&
-		sess.AmountTotal == int64(math.Round(venueFee*100))
-}
-
-// venueFeePaymentMatches checks a captured PayPal order is the venue fee for
-// this event: the reference set by Checkout, in USD, for the full amount.
-func venueFeePaymentMatches(captured *services.CapturedOrder, eventID string, venueFee float64) bool {
-	return captured != nil &&
-		captured.Reference == "venue-fee-"+eventID &&
-		captured.Currency == "USD" &&
-		math.Round(captured.Amount*100) == math.Round(venueFee*100)
+		sess.AmountTotal == feeCents
 }
 
 func (h *EventHandler) signVenueFeeState(eventID, hostID string, venueFee float64) (string, error) {
@@ -457,13 +440,16 @@ func templateEscape(value string) string {
 }
 
 type ticketSetupRequest struct {
-	TicketName   string  `json:"ticket_name"`
-	TicketPrice  float64 `json:"ticket_price"`
-	TicketType   string  `json:"ticket_type"`
-	CardBgFrom   string  `json:"card_bg_from"`
-	CardBgTo     string  `json:"card_bg_to"`
-	CardBgImage  string  `json:"card_bg_image"`
-	VenueAddress string  `json:"venue_address"`
+	TicketName  string  `json:"ticket_name"`
+	TicketPrice float64 `json:"ticket_price"`
+	// MaxTickets caps sales (PAY-09). Omitted keeps the current cap; 0 or
+	// null removes it.
+	MaxTickets   *int   `json:"max_tickets"`
+	TicketType   string `json:"ticket_type"`
+	CardBgFrom   string `json:"card_bg_from"`
+	CardBgTo     string `json:"card_bg_to"`
+	CardBgImage  string `json:"card_bg_image"`
+	VenueAddress string `json:"venue_address"`
 }
 
 func (h *EventHandler) TicketSetup(c *fiber.Ctx) error {
@@ -483,6 +469,29 @@ func (h *EventHandler) TicketSetup(c *fiber.Ctx) error {
 	if req.TicketPrice < 0 {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "ticket price cannot be negative"})
 	}
+	// Exact cents: no fractions of a cent, no float rounding (PAY-06).
+	priceCents, err := services.DollarsToCents(req.TicketPrice)
+	if err != nil || priceCents > services.MaxTicketPriceCents {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "enter a ticket price in dollars and cents, up to $999,999.99"})
+	}
+	// Paid tickets must cover Stripe's minimum charge.
+	if priceCents > 0 && priceCents < services.MinTicketPriceCents {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "paid tickets must be at least $0.50"})
+	}
+	// Only a request that sends max_tickets changes the cap, so older
+	// clients that don't know about it never clear one by accident.
+	var fields map[string]json.RawMessage
+	_ = json.Unmarshal(c.Body(), &fields)
+	_, setCap := fields["max_tickets"]
+	var capValue *int
+	if setCap {
+		if req.MaxTickets != nil && *req.MaxTickets != 0 {
+			if *req.MaxTickets < 0 || *req.MaxTickets > 1_000_000 {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "capacity must be between 1 and 1,000,000, or empty for no limit"})
+			}
+			capValue = req.MaxTickets
+		}
+	}
 	if req.CardBgFrom == "" {
 		req.CardBgFrom = "#7c3aed"
 	}
@@ -498,17 +507,44 @@ func (h *EventHandler) TicketSetup(c *fiber.Ctx) error {
 		req.VenueAddress = ""
 	}
 
-	result, err := h.DB.Exec(context.Background(),
-		`UPDATE events
-		 SET ticket_name = $1, ticket_price = $2, ticket_type = $3,
-		     card_bg_from = $4, card_bg_to = $5, card_bg_image = $6, venue_address = $7
-		 WHERE id = $8 AND host_id = $9 AND ends_at > NOW()`,
-		req.TicketName, req.TicketPrice, req.TicketType,
-		req.CardBgFrom, req.CardBgTo, req.CardBgImage, nullIfEmpty(req.VenueAddress),
-		eventID, hostID,
-	)
-	if err != nil || result.RowsAffected() == 0 {
+	ctx := context.Background()
+	tx, err := h.DB.Begin(ctx)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save ticket"})
+	}
+	defer tx.Rollback(ctx)
+	// Lock the event so the capacity check can't race a purchase (lock,
+	// then count in a new statement: see checkSale).
+	var one, held int
+	if err := tx.QueryRow(ctx,
+		`SELECT 1 FROM events WHERE id = $1 AND host_id = $2 AND ends_at > NOW() FOR UPDATE`, eventID, hostID,
+	).Scan(&one); err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "event not found or has already ended"})
+	}
+	if err := tx.QueryRow(ctx,
+		`SELECT (SELECT count(*) FROM tickets t WHERE t.event_id = $1 AND t.voided_at IS NULL)
+		      + (SELECT COALESCE(SUM(o.quantity), 0) FROM orders o WHERE o.event_id = $1 AND o.kind = 'ticket'
+		           AND o.status = 'pending' AND o.reserved_until > NOW())`, eventID,
+	).Scan(&held); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save ticket"})
+	}
+	if setCap && capValue != nil && *capValue < held {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": fmt.Sprintf("capacity can't be below the %d tickets already sold or being bought", held)})
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE events
+		 SET ticket_name = $1, ticket_price = ($2::bigint)::numeric / 100, ticket_type = $3,
+		     card_bg_from = $4, card_bg_to = $5, card_bg_image = $6, venue_address = $7,
+		     max_tickets = CASE WHEN $10 THEN $11::int ELSE max_tickets END
+		 WHERE id = $8 AND host_id = $9`,
+		req.TicketName, priceCents, req.TicketType,
+		req.CardBgFrom, req.CardBgTo, req.CardBgImage, nullIfEmpty(req.VenueAddress),
+		eventID, hostID, setCap, capValue,
+	); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save ticket"})
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save ticket"})
 	}
 
 	return c.JSON(fiber.Map{"ok": true})
@@ -612,13 +648,20 @@ func (h *EventHandler) ListByHost(c *fiber.Ctx) error {
 		        e.ticket_price, e.ticket_type, e.max_tickets,
 		        e.card_bg_from, e.card_bg_to, e.card_bg_image, e.logo_image, e.venue_address,
 		        e.venue_fee, e.venue_paid, e.is_active, (e.ends_at < NOW()) AS expired,
-		        e.created_at, COUNT(t.id) AS ticket_count,
-		        e.assigned_to, COALESCE(u.full_name, u.email) AS assigned_to_name
+		        e.created_at,
+		        (SELECT count(*) FROM tickets t WHERE t.event_id = e.id AND t.voided_at IS NULL) AS ticket_count,
+		        e.assigned_to, COALESCE(u.full_name, u.email) AS assigned_to_name,
+		        COALESCE(f.gross, 0), COALESCE(f.platform_fee, 0), COALESCE(f.refunded, 0)
 		 FROM events e
-		 LEFT JOIN tickets t ON t.event_id = e.id
 		 LEFT JOIN users u ON u.id = e.assigned_to
+		 LEFT JOIN LATERAL (
+		     SELECT SUM(o.amount_cents) AS gross,
+		            SUM(o.platform_fee_cents - o.platform_fee_refunded_cents) AS platform_fee,
+		            SUM(o.refunded_cents) AS refunded
+		     FROM orders o
+		     WHERE o.event_id = e.id AND o.kind = 'ticket' AND o.status IN ('paid', 'needs_attention')
+		 ) f ON true
 		 WHERE e.host_id = $1 AND ($2::uuid IS NULL OR e.assigned_to = $2) AND `+dateFilter+`
-		 GROUP BY e.id, u.id
 		 ORDER BY `+orderBy,
 		hostID, staffID,
 	)
@@ -650,6 +693,13 @@ func (h *EventHandler) ListByHost(c *fiber.Ctx) error {
 		TicketCount    int        `json:"ticket_count"`
 		AssignedTo     *string    `json:"assigned_to"`
 		AssignedToName *string    `json:"assigned_to_name"`
+		// Sales figures from the order books, in cents (Phase 2): what
+		// buyers paid, the platform's commission net of refunds, refunds,
+		// and the host's net.
+		GrossCents       int64 `json:"gross_cents"`
+		PlatformFeeCents int64 `json:"platform_fee_cents"`
+		RefundedCents    int64 `json:"refunded_cents"`
+		HostNetCents     int64 `json:"host_net_cents"`
 	}
 
 	events := []eventRow{}
@@ -662,9 +712,11 @@ func (h *EventHandler) ListByHost(c *fiber.Ctx) error {
 			&e.VenueFee, &e.VenuePaid, &e.IsActive, &e.Expired,
 			&e.CreatedAt, &e.TicketCount,
 			&e.AssignedTo, &e.AssignedToName,
+			&e.GrossCents, &e.PlatformFeeCents, &e.RefundedCents,
 		); err != nil {
 			continue
 		}
+		e.HostNetCents = e.GrossCents - e.RefundedCents - e.PlatformFeeCents
 		events = append(events, e)
 	}
 

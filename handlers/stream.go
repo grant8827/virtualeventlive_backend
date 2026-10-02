@@ -45,6 +45,7 @@ func (h *StreamHandler) Watch(c *fiber.Ctx) error {
 		 JOIN events e ON e.id = t.event_id
 		 WHERE t.access_token = $1
 		   AND t.buyer_id     = $2
+		   AND t.voided_at IS NULL
 		   AND e.is_active    = true
 		   AND e.venue_paid   = true
 		   AND e.cancelled_at IS NULL
@@ -106,7 +107,7 @@ func (h *StreamHandler) Heartbeat(c *fiber.Ctx) error {
 	// Lightweight ownership check
 	var exists bool
 	_ = h.DB.QueryRow(context.Background(),
-		`SELECT EXISTS(SELECT 1 FROM tickets WHERE access_token = $1 AND buyer_id = $2)`,
+		`SELECT EXISTS(SELECT 1 FROM tickets WHERE access_token = $1 AND buyer_id = $2 AND voided_at IS NULL)`,
 		req.TicketToken, buyerID,
 	).Scan(&exists)
 	if !exists {
@@ -145,7 +146,7 @@ func (h *StreamHandler) Release(c *fiber.Ctx) error {
 
 	var exists bool
 	_ = h.DB.QueryRow(context.Background(),
-		`SELECT EXISTS(SELECT 1 FROM tickets WHERE access_token = $1 AND buyer_id = $2)`,
+		`SELECT EXISTS(SELECT 1 FROM tickets WHERE access_token = $1 AND buyer_id = $2 AND voided_at IS NULL)`,
 		req.TicketToken, buyerID,
 	).Scan(&exists)
 	if !exists {

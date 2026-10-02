@@ -1,6 +1,7 @@
 package routes
 
 import (
+	"context"
 	"log"
 	"time"
 
@@ -222,6 +223,22 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	su.Patch("/events/:id", superH.UpdateEvent)
 	su.Post("/events/:id/activate", superH.ActivateEvent)
 	su.Post("/events/:id/cancel", superH.CancelEvent)
+	// Payments console (Phase 2): orders, refunds, reconciliation.
+	financeH := &handlers.FinanceHandler{SuperuserHandler: *superH, Cfg: cfg, PayPal: newPayPalService(cfg)}
+	su.Get("/orders", financeH.ListOrders)
+	su.Get("/orders/:id", financeH.GetOrder)
+	su.Post("/orders/:id/refund", perUser("refund", 30, time.Hour), financeH.RefundOrder)
+	su.Get("/finance/reconciliation", financeH.Reconciliation)
+	su.Post("/finance/reconcile", perUser("reconcile", 10, time.Hour), financeH.RunProviderReconciliation)
+
+	// Scheduled reconciliation: compares orders with Stripe/PayPal, books
+	// actual fees, repairs payments whose webhook never arrived, and checks
+	// the books. One instance at a time (advisory lock).
+	if every, err := cfg.ReconcileEvery(); err == nil && every > 0 {
+		handlers.StartReconciler(context.Background(), &handlers.ProviderReconciler{
+			DB: db, Cfg: cfg, PayPal: newPayPalService(cfg), Email: emailSvc, IVS: ivsSvc, Repair: true,
+		}, every)
+	}
 
 	// Tickets
 	ticketH := &handlers.TicketHandler{

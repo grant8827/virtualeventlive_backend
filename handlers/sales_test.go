@@ -23,14 +23,16 @@ func TestSalesRule(t *testing.T) {
 		s    saleState
 		want error
 	}{
-		"on sale":        {ok, nil},
-		"disabled":       {with(func(s *saleState) { s.Active = false }), errSaleDisabled},
-		"cancelled":      {with(func(s *saleState) { s.Cancelled = true }), errSaleCancelled},
-		"ended":          {with(func(s *saleState) { s.EndsAt = now.Add(-time.Minute) }), errSaleEnded},
-		"ends right now": {with(func(s *saleState) { s.EndsAt = now }), errSaleEnded},
-		"venue unpaid":   {with(func(s *saleState) { s.VenuePaid = false }), errSaleVenueUnpaid},
-		"sold out":       {with(func(s *saleState) { s.MaxTickets = &one; s.Sold = 1 }), errSaleSoldOut},
-		"last ticket":    {with(func(s *saleState) { s.MaxTickets = &two; s.Sold = 1 }), nil},
+		"on sale":         {ok, nil},
+		"disabled":        {with(func(s *saleState) { s.Active = false }), errSaleDisabled},
+		"cancelled":       {with(func(s *saleState) { s.Cancelled = true }), errSaleCancelled},
+		"ended":           {with(func(s *saleState) { s.EndsAt = now.Add(-time.Minute) }), errSaleEnded},
+		"ends right now":  {with(func(s *saleState) { s.EndsAt = now }), errSaleEnded},
+		"venue unpaid":    {with(func(s *saleState) { s.VenuePaid = false }), errSaleVenueUnpaid},
+		"sold out":        {with(func(s *saleState) { s.MaxTickets = &one; s.Sold = 1 }), errSaleSoldOut},
+		"last ticket":     {with(func(s *saleState) { s.MaxTickets = &two; s.Sold = 1 }), nil},
+		"two of last one": {with(func(s *saleState) { s.MaxTickets = &two; s.Sold = 1; s.Quantity = 2 }), errSaleSoldOut},
+		"two of two":      {with(func(s *saleState) { s.MaxTickets = &two; s.Quantity = 2 }), nil},
 		// Cancellation wins over everything else.
 		"cancelled+ended": {with(func(s *saleState) { s.Cancelled = true; s.EndsAt = now.Add(-time.Hour) }), errSaleCancelled},
 	}
@@ -67,10 +69,10 @@ func TestClosedEventsCannotIssueFreeTickets(t *testing.T) {
 
 	for name, ev := range closedEvents {
 		event := createTestEvent(t, db, host, ev)
-		if _, _, err := h.issueFreeTicket(ctx, event, nil, &email); !isSaleRuleError(err) {
+		if _, _, err := h.issueFreeTicket(ctx, event, nil, email); !isSaleRuleError(err) {
 			t.Errorf("%s (guest): got %v, want a sales-rule refusal", name, err)
 		}
-		if _, _, err := h.issueFreeTicket(ctx, event, &host, nil); !isSaleRuleError(err) {
+		if _, _, err := h.issueFreeTicket(ctx, event, &host, "host-"+uniq()+"@phase0.test"); !isSaleRuleError(err) {
 			t.Errorf("%s (signed-in): got %v, want a sales-rule refusal", name, err)
 		}
 		if n := ticketCount(t, event); n != 0 {
@@ -121,7 +123,7 @@ func TestCapacityCannotBeOversold(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			email := "rush-" + uniq() + "@phase0.test"
-			_, _, _ = h.issueFreeTicket(context.Background(), event, nil, &email)
+			_, _, _ = h.issueFreeTicket(context.Background(), event, nil, email)
 		}()
 	}
 	wg.Wait()

@@ -65,9 +65,10 @@ func testDB(t *testing.T) *pgxpool.Pool {
 
 func testConfig() *config.Config {
 	return &config.Config{
-		AppEnv:      "test",
-		JWTSecret:   "test-secret-for-handlers",
-		FrontendURL: "http://frontend.test",
+		AppEnv:         "test",
+		JWTSecret:      "test-secret-for-handlers",
+		FrontendURL:    "http://frontend.test",
+		PlatformFeeBPS: 1000,
 	}
 }
 

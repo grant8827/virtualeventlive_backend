@@ -78,12 +78,18 @@ func (h *TicketHandler) Claim(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "This ticket link isn't valid."})
 	}
 	var (
-		ticketID  *string
-		expiresAt time.Time
+		ticketID    *string
+		expiresAt   time.Time
+		orderStatus *string
 	)
 	err := h.DB.QueryRow(context.Background(),
-		`SELECT ticket_id, expires_at FROM ticket_claims WHERE token_hash = $1`, hashInvitationToken(token),
-	).Scan(&ticketID, &expiresAt)
+		`SELECT c.ticket_id, c.expires_at,
+		        (SELECT o.status FROM orders o
+		         WHERE (o.provider = 'stripe' AND o.provider_checkout_id = c.stripe_session_id)
+		            OR (o.provider = 'paypal' AND o.provider_checkout_id = c.paypal_order_id)
+		         LIMIT 1)
+		 FROM ticket_claims c WHERE c.token_hash = $1`, hashInvitationToken(token),
+	).Scan(&ticketID, &expiresAt, &orderStatus)
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "This ticket link isn't valid."})
 	}
@@ -91,6 +97,14 @@ func (h *TicketHandler) Claim(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusGone).JSON(fiber.Map{"error": "This ticket link has expired. Your ticket is in your email, or use Find My Tickets."})
 	}
 	if ticketID == nil {
+		if orderStatus != nil {
+			switch *orderStatus {
+			case "failed", "expired":
+				return c.Status(fiber.StatusGone).JSON(fiber.Map{"status": *orderStatus, "error": "This payment didn't go through, so no ticket was issued. You weren't charged."})
+			case "needs_attention":
+				return c.Status(fiber.StatusConflict).JSON(fiber.Map{"status": *orderStatus, "error": "We received your payment but couldn't issue a ticket. Our team has been alerted and will refund you."})
+			}
+		}
 		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{"status": "pending"})
 	}
 	rows, err := h.loadTicketRows(context.Background(), `t.id = $1`, *ticketID)
@@ -111,7 +125,7 @@ func (h *TicketHandler) loadTicketRows(ctx context.Context, where string, args .
 		 FROM tickets t
 		 JOIN events e ON e.id = t.event_id
 		 LEFT JOIN users u ON u.id = t.buyer_id
-		 WHERE `+where+`
+		 WHERE t.voided_at IS NULL AND `+where+`
 		 ORDER BY t.purchased_at DESC`, args...)
 	if err != nil {
 		return nil, err
@@ -194,7 +208,7 @@ func (h *TicketHandler) emailTicketList(email string) {
 			 FROM tickets t
 			 JOIN events e ON e.id = t.event_id
 			 LEFT JOIN users u ON u.id = t.buyer_id
-			 WHERE (lower(u.email) = $1 OR lower(t.guest_email) = $1) AND e.ends_at > NOW()
+			 WHERE (lower(u.email) = $1 OR lower(t.guest_email) = $1) AND e.ends_at > NOW() AND t.voided_at IS NULL
 			 ORDER BY e.start_time`, email)
 		if err != nil {
 			log.Printf("ticket lookup email: query failed: %v", err)
@@ -244,26 +258,33 @@ func (h *TicketHandler) limiter() *middleware.RateLimiter {
 }
 
 // issueFreeTicket creates a free ticket for a signed-in buyer or a guest
-// email, plus its claim link, in one transaction.
-func (h *TicketHandler) issueFreeTicket(ctx context.Context, eventID string, buyerID, guestEmail *string) (accessToken, claim string, err error) {
+// email, as a zero-amount order, plus its claim link, in one transaction.
+// One free ticket per email per event (PAY-11).
+func (h *TicketHandler) issueFreeTicket(ctx context.Context, eventID string, buyerID *string, email string) (accessToken, claim string, err error) {
 	tx, err := h.DB.Begin(ctx)
 	if err != nil {
 		return "", "", err
 	}
 	defer tx.Rollback(ctx)
 
-	// The sales rule, checked with the event row locked so concurrent
+	// The sales rule is checked with the event row locked, so concurrent
 	// requests can't oversell or slip past a cancellation.
-	if err := canSellTickets(ctx, tx, eventID, true); err != nil {
+	o, err := insertOrder(ctx, tx, newOrder{
+		Kind: "ticket", EventID: eventID, BuyerID: buyerID, BuyerEmail: email,
+		Quantity: 1, Fee: feeRule(h.Cfg), Provider: "free",
+	}, "pending")
+	if err != nil {
 		return "", "", err
 	}
-
-	accessToken = services.GenerateTicketCode()
-	var ticketID string
-	if err := tx.QueryRow(ctx,
-		`INSERT INTO tickets (event_id, buyer_id, guest_email, access_token) VALUES ($1, $2, $3, $4) RETURNING id`,
-		eventID, buyerID, guestEmail, accessToken,
-	).Scan(&ticketID); err != nil {
+	codes, err := markOrderPaid(ctx, tx, o, fulfillment{}, nil)
+	if err != nil {
+		if isUniqueViolation(err, "idx_orders_one_free_ticket") {
+			return "", "", errSaleHasFreeTicket
+		}
+		return "", "", err
+	}
+	ticketID, err := firstTicketID(ctx, tx, o.ID)
+	if err != nil {
 		return "", "", err
 	}
 	claim, err = createTicketClaim(ctx, tx, eventID, ticketID)
@@ -273,5 +294,5 @@ func (h *TicketHandler) issueFreeTicket(ctx context.Context, eventID string, buy
 	if err := tx.Commit(ctx); err != nil {
 		return "", "", err
 	}
-	return accessToken, claim, nil
+	return codes[0], claim, nil
 }

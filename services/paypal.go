@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"strconv"
 )
 
 // PayPalService implements PayPal Checkout and Commerce Platform multiparty
@@ -19,6 +18,8 @@ type PayPalService struct {
 	PartnerMerchantID    string
 	PartnerAttributionID string
 	WebhookID            string
+	// APIBase overrides the PayPal API host (tests point it at a local fake).
+	APIBase string
 }
 
 // VerifyWebhookSignature asks PayPal to validate the signed transmission.
@@ -68,14 +69,18 @@ func (p *PayPalService) VerifyWebhookSignature(transmissionID, transmissionTime,
 }
 
 // CheckoutOrderRequest describes a one-time PayPal Checkout payment.
+// Amounts are cents and are sent to PayPal as exact decimal strings.
 type CheckoutOrderRequest struct {
-	Amount          float64
-	Description     string
-	Reference       string
-	ReturnURL       string
-	CancelURL       string
-	PayeeMerchantID string
-	PlatformFee     float64
+	AmountCents      int64
+	Description      string
+	Reference        string
+	ReturnURL        string
+	CancelURL        string
+	PayeeMerchantID  string
+	PlatformFeeCents int64
+	// CustomID is our order ID; PayPal echoes it on captures, refunds and
+	// disputes so notifications can be matched to the order.
+	CustomID string
 }
 
 type CheckoutOrder struct {
@@ -179,6 +184,9 @@ func (p *PayPalService) GetSellerStatus(merchantID string) (*SellerStatus, error
 }
 
 func (p *PayPalService) baseURL() string {
+	if p.APIBase != "" {
+		return p.APIBase
+	}
 	if p.Environment == "live" {
 		return "https://api-m.paypal.com"
 	}
@@ -228,10 +236,11 @@ func (p *PayPalService) CreateCheckoutOrder(order CheckoutOrderRequest) (*Checko
 		"intent": "CAPTURE",
 		"purchase_units": []map[string]any{{
 			"reference_id": order.Reference,
+			"custom_id":    order.CustomID,
 			"description":  order.Description,
 			"amount": map[string]string{
 				"currency_code": "USD",
-				"value":         strconv.FormatFloat(order.Amount, 'f', 2, 64),
+				"value":         FormatCents(order.AmountCents),
 			},
 		}},
 		"application_context": map[string]string{
@@ -244,7 +253,11 @@ func (p *PayPalService) CreateCheckoutOrder(order CheckoutOrderRequest) (*Checko
 	if order.PayeeMerchantID != "" {
 		unit := body["purchase_units"].([]map[string]any)[0]
 		unit["payee"] = map[string]string{"merchant_id": order.PayeeMerchantID}
-		unit["payment_instruction"] = map[string]any{"disbursement_mode": "INSTANT", "platform_fees": []map[string]any{{"amount": map[string]string{"currency_code": "USD", "value": strconv.FormatFloat(order.PlatformFee, 'f', 2, 64)}}}}
+		instruction := map[string]any{"disbursement_mode": "INSTANT"}
+		if order.PlatformFeeCents > 0 {
+			instruction["platform_fees"] = []map[string]any{{"amount": map[string]string{"currency_code": "USD", "value": FormatCents(order.PlatformFeeCents)}}}
+		}
+		unit["payment_instruction"] = instruction
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -289,18 +302,20 @@ func (p *PayPalService) CreateCheckoutOrder(order CheckoutOrderRequest) (*Checko
 	return nil, fmt.Errorf("paypal order did not include an approval URL")
 }
 
-// CaptureCheckoutOrder captures a buyer-approved PayPal order.
-func (p *PayPalService) CaptureCheckoutOrder(orderID string, merchantID ...string) error {
-	_, err := p.CaptureOrder(orderID, merchantID...)
-	return err
+// CapturedOrder is what PayPal reports was actually paid, so callers can
+// check the payment belongs to what they're about to fulfil (PAY-04).
+type CapturedOrder struct {
+	Reference       string // the purchase unit's reference_id set at order creation
+	CustomID        string // our order ID
+	PayeeMerchantID string // the seller the money went to
+	CaptureID       string // PayPal's payment reference, kept on the order
+	Currency        string // e.g. USD
+	AmountCents     int64  // total of the completed captures
 }
 
-// CapturedOrder is what PayPal reports was actually paid, so callers can
-// check the payment belongs to what they're about to fulfil.
-type CapturedOrder struct {
-	Reference string  // the purchase unit's reference_id set at order creation
-	Currency  string  // e.g. USD
-	Amount    float64 // total of the completed captures
+type paypalAmount struct {
+	CurrencyCode string `json:"currency_code"`
+	Value        string `json:"value"`
 }
 
 // CaptureOrder captures a buyer-approved order and returns what was paid.
@@ -337,13 +352,16 @@ func (p *PayPalService) CaptureOrder(orderID string, merchantID ...string) (*Cap
 		Message       string `json:"message"`
 		PurchaseUnits []struct {
 			ReferenceID string `json:"reference_id"`
-			Payments    struct {
+			CustomID    string `json:"custom_id"`
+			Payee       struct {
+				MerchantID string `json:"merchant_id"`
+			} `json:"payee"`
+			Payments struct {
 				Captures []struct {
-					Status string `json:"status"`
-					Amount struct {
-						CurrencyCode string `json:"currency_code"`
-						Value        string `json:"value"`
-					} `json:"amount"`
+					ID       string       `json:"id"`
+					Status   string       `json:"status"`
+					CustomID string       `json:"custom_id"`
+					Amount   paypalAmount `json:"amount"`
 				} `json:"captures"`
 			} `json:"payments"`
 		} `json:"purchase_units"`
@@ -359,17 +377,148 @@ func (p *PayPalService) CaptureOrder(orderID string, merchantID ...string) (*Cap
 	if len(out.PurchaseUnits) > 0 {
 		unit := out.PurchaseUnits[0]
 		captured.Reference = unit.ReferenceID
+		captured.CustomID = unit.CustomID
+		captured.PayeeMerchantID = unit.Payee.MerchantID
 		for _, c := range unit.Payments.Captures {
 			if c.Status != "COMPLETED" {
 				continue
 			}
-			v, err := strconv.ParseFloat(c.Amount.Value, 64)
+			v, err := ParseDecimalCents(c.Amount.Value)
 			if err != nil {
 				return nil, fmt.Errorf("paypal capture amount: %w", err)
 			}
-			captured.Amount += v
+			if captured.Currency != "" && captured.Currency != c.Amount.CurrencyCode {
+				return nil, fmt.Errorf("paypal capture has mixed currencies")
+			}
+			captured.AmountCents += v
 			captured.Currency = c.Amount.CurrencyCode
+			if captured.CaptureID == "" {
+				captured.CaptureID = c.ID
+			}
+			if captured.CustomID == "" {
+				captured.CustomID = c.CustomID
+			}
 		}
 	}
 	return captured, nil
+}
+
+// PayPalRefund is PayPal's answer to a refund request.
+type PayPalRefund struct {
+	ID          string
+	Status      string // COMPLETED, PENDING, FAILED, CANCELLED
+	AmountCents int64
+}
+
+// RefundCapture refunds amountCents of a capture from the seller's account,
+// returning the proportional platform fee as well. requestID makes retries
+// idempotent.
+func (p *PayPalService) RefundCapture(captureID string, amountCents, platformFeeCents int64, merchantID, requestID, note string) (*PayPalRefund, error) {
+	if !p.Enabled() {
+		return nil, fmt.Errorf("paypal checkout not configured")
+	}
+	token, err := p.accessToken()
+	if err != nil {
+		return nil, err
+	}
+	body := map[string]any{
+		"amount":        map[string]string{"currency_code": "USD", "value": FormatCents(amountCents)},
+		"note_to_payer": note,
+	}
+	if platformFeeCents > 0 {
+		body["payment_instruction"] = map[string]any{"platform_fees": []map[string]any{{
+			"amount": map[string]string{"currency_code": "USD", "value": FormatCents(platformFeeCents)},
+		}}}
+	}
+	payload, _ := json.Marshal(body)
+	req, err := http.NewRequest(http.MethodPost, p.baseURL()+"/v2/payments/captures/"+url.PathEscape(captureID)+"/refund", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Prefer", "return=representation")
+	req.Header.Set("PayPal-Request-Id", requestID)
+	if merchantID != "" {
+		req.Header.Set("PayPal-Partner-Attribution-Id", p.PartnerAttributionID)
+		req.Header.Set("PayPal-Auth-Assertion", p.authAssertion(merchantID))
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("paypal refund request: %w", err)
+	}
+	defer resp.Body.Close()
+	var out struct {
+		ID      string       `json:"id"`
+		Status  string       `json:"status"`
+		Amount  paypalAmount `json:"amount"`
+		Name    string       `json:"name"`
+		Message string       `json:"message"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("paypal refund decode: %w", err)
+	}
+	if resp.StatusCode >= 300 || out.ID == "" {
+		return nil, fmt.Errorf("paypal refund failed: %s %s (status %d)", out.Name, out.Message, resp.StatusCode)
+	}
+	cents, err := ParseDecimalCents(out.Amount.Value)
+	if err != nil {
+		return nil, fmt.Errorf("paypal refund amount: %w", err)
+	}
+	return &PayPalRefund{ID: out.ID, Status: out.Status, AmountCents: cents}, nil
+}
+
+// PayPalCapture is a capture's current state, for reconciliation.
+type PayPalCapture struct {
+	ID          string
+	Status      string // COMPLETED, PARTIALLY_REFUNDED, REFUNDED, ...
+	Currency    string
+	AmountCents int64
+	FeeCents    int64 // PayPal's fee (charged to the seller)
+}
+
+// GetCapture reads a capture as PayPal currently sees it.
+func (p *PayPalService) GetCapture(captureID string) (*PayPalCapture, error) {
+	if !p.Enabled() {
+		return nil, fmt.Errorf("paypal checkout not configured")
+	}
+	token, err := p.accessToken()
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodGet, p.baseURL()+"/v2/payments/captures/"+url.PathEscape(captureID), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("paypal capture lookup: %w", err)
+	}
+	defer resp.Body.Close()
+	var out struct {
+		ID                        string       `json:"id"`
+		Status                    string       `json:"status"`
+		Amount                    paypalAmount `json:"amount"`
+		SellerReceivableBreakdown struct {
+			PayPalFee paypalAmount `json:"paypal_fee"`
+		} `json:"seller_receivable_breakdown"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("paypal capture lookup decode: %w", err)
+	}
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("paypal capture lookup failed (status %d)", resp.StatusCode)
+	}
+	amount, err := ParseDecimalCents(out.Amount.Value)
+	if err != nil {
+		return nil, err
+	}
+	capture := &PayPalCapture{ID: out.ID, Status: out.Status, Currency: out.Amount.CurrencyCode, AmountCents: amount}
+	if v := out.SellerReceivableBreakdown.PayPalFee.Value; v != "" {
+		if fee, err := ParseDecimalCents(v); err == nil {
+			capture.FeeCents = fee
+		}
+	}
+	return capture, nil
 }

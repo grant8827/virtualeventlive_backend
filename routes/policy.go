@@ -36,7 +36,7 @@ const (
 var AccessPolicy = map[string]AccessClass{
 	"GET /health":                          Public,
 	"POST /api/v1/webhooks/stripe":         Public, // Stripe signature
-	"POST /api/v1/webhooks/paypal":         Public, // PayPal signature verification
+	"POST /api/v1/webhooks/paypal":         Public, // PayPal signature verification; idempotent inbox
 	"GET /api/v1/pricing":                  Public,
 	"GET /api/v1/events/public":            Public,
 	"GET /api/v1/events/:id":               Public,
@@ -64,7 +64,7 @@ var AccessPolicy = map[string]AccessClass{
 	"POST /api/v1/events/:id/wipay/launch":   Public,
 	"GET /api/v1/events/:id/wipay/complete":  Public,
 	"POST /api/v1/events/:id/wipay/complete": Public,
-	"GET /api/v1/events/:id/paypal/complete": Public,
+	"GET /api/v1/events/:id/paypal/complete": Public, // retired: always redirects "not paid"
 	"GET /api/v1/events/:id/stripe/complete": Public,
 
 	// Host events
@@ -120,6 +120,11 @@ var AccessPolicy = map[string]AccessClass{
 	"PATCH /api/v1/superuser/events/:id":            Superuser,
 	"POST /api/v1/superuser/events/:id/activate":    Superuser,
 	"POST /api/v1/superuser/events/:id/cancel":      Superuser,
+	"GET /api/v1/superuser/orders":                  Superuser,
+	"GET /api/v1/superuser/orders/:id":              Superuser,
+	"POST /api/v1/superuser/orders/:id/refund":      Superuser,
+	"GET /api/v1/superuser/finance/reconciliation":  Superuser,
+	"POST /api/v1/superuser/finance/reconcile":      Superuser,
 
 	// Tickets
 	"POST /api/v1/tickets/lookup":         Public, // emails the address its tickets; generic reply, rate-limited
