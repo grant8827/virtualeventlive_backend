@@ -145,3 +145,46 @@ func TestPasswordResetSignsOutEverywhere(t *testing.T) {
 		t.Fatal("session survived a password reset")
 	}
 }
+
+func TestLoginLockoutAfterRepeatedFailures(t *testing.T) {
+	db := testDB(t)
+	h := &AuthHandler{DB: db, Cfg: testConfig(), Session: testSessionCfg, Limiter: middleware.NewRateLimiter(nil)}
+	app := fiber.New()
+	app.Post("/login", h.Login)
+	_, email := createLoginUser(t, "correct-horse-1")
+
+	for i := 0; i < loginMaxFailures; i++ {
+		if r := send(t, app, "POST", "/login", `{"email":"`+email+`","password":"wrong"}`, ""); r.StatusCode != 401 {
+			t.Fatalf("attempt %d: %d", i+1, r.StatusCode)
+		}
+	}
+	// Locked: even the right password is refused for now.
+	if r := send(t, app, "POST", "/login", `{"email":"`+email+`","password":"correct-horse-1"}`, ""); r.StatusCode != fiber.StatusTooManyRequests {
+		t.Fatalf("correct password during lockout: %d", r.StatusCode)
+	}
+	// Unknown emails lock the same way, so lockout doesn't reveal accounts.
+	ghost := "ghost-" + uniq() + "@phase1.test"
+	for i := 0; i < loginMaxFailures; i++ {
+		send(t, app, "POST", "/login", `{"email":"`+ghost+`","password":"wrong"}`, "")
+	}
+	if r := send(t, app, "POST", "/login", `{"email":"`+ghost+`","password":"wrong"}`, ""); r.StatusCode != fiber.StatusTooManyRequests {
+		t.Fatalf("unknown email not locked the same way: %d", r.StatusCode)
+	}
+}
+
+func TestSuccessfulLoginResetsFailureCount(t *testing.T) {
+	db := testDB(t)
+	h := &AuthHandler{DB: db, Cfg: testConfig(), Session: testSessionCfg, Limiter: middleware.NewRateLimiter(nil)}
+	app := fiber.New()
+	app.Post("/login", h.Login)
+	_, email := createLoginUser(t, "correct-horse-1")
+	for i := 0; i < loginMaxFailures-1; i++ {
+		send(t, app, "POST", "/login", `{"email":"`+email+`","password":"wrong"}`, "")
+	}
+	if r := send(t, app, "POST", "/login", `{"email":"`+email+`","password":"correct-horse-1"}`, ""); r.StatusCode != 200 {
+		t.Fatalf("login: %d", r.StatusCode)
+	}
+	if r := send(t, app, "POST", "/login", `{"email":"`+email+`","password":"wrong"}`, ""); r.StatusCode != 401 {
+		t.Fatalf("failure count was not reset: %d", r.StatusCode)
+	}
+}

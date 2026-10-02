@@ -2,17 +2,15 @@ package handlers
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"log"
 	"net/mail"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"vertualeventlive/backend/middleware"
 	"vertualeventlive/backend/services"
 )
 
@@ -162,8 +160,12 @@ func (h *TicketHandler) LookupByEmail(c *fiber.Ctx) error {
 	// Limits: one email per address per window, and a cap per client IP, so
 	// the endpoint can't be used to flood someone's inbox. Same response
 	// either way.
-	if !lookupLimiter.allow("ip:"+c.IP(), lookupPerIP, lookupWindow) ||
-		!lookupLimiter.allow("email:"+hashEmail(email), 1, lookupEmailEvery) {
+	lim := h.limiter()
+	ctx := context.Background()
+	if n, _ := lim.Hit(ctx, "ticket-lookup-ip:"+middleware.ClientIP(c), lookupWindow); n > lookupPerIP {
+		return respond()
+	}
+	if n, _ := lim.Hit(ctx, "ticket-lookup-email:"+middleware.HashKey(email), lookupEmailEvery); n > 1 {
 		return respond()
 	}
 	h.emailTicketList(email)
@@ -223,11 +225,6 @@ func (h *TicketHandler) emailTicketList(email string) {
 	}()
 }
 
-func hashEmail(email string) string {
-	sum := sha256.Sum256([]byte(email))
-	return hex.EncodeToString(sum[:])
-}
-
 // ─── Rate limiting ──────────────────────────────────────────────────────────
 
 const (
@@ -236,46 +233,14 @@ const (
 	lookupEmailEvery = 2 * time.Minute
 )
 
-var lookupLimiter = newKeyedLimiter()
+// fallbackLimiter is used when no shared limiter is configured (tests).
+var fallbackLimiter = middleware.NewRateLimiter(nil)
 
-// keyedLimiter is a small in-memory fixed-window limiter. It is per server
-// instance, which is enough to stop casual abuse in Phase 0.
-type keyedLimiter struct {
-	mu      sync.Mutex
-	windows map[string]*limitWindow
-}
-
-type limitWindow struct {
-	start time.Time
-	count int
-}
-
-func newKeyedLimiter() *keyedLimiter {
-	return &keyedLimiter{windows: map[string]*limitWindow{}}
-}
-
-// allow reports whether key may act again: at most max times per window.
-func (l *keyedLimiter) allow(key string, max int, window time.Duration) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	now := time.Now()
-	if len(l.windows) > 10000 {
-		for k, w := range l.windows {
-			if now.Sub(w.start) > window {
-				delete(l.windows, k)
-			}
-		}
+func (h *TicketHandler) limiter() *middleware.RateLimiter {
+	if h.Limiter != nil {
+		return h.Limiter
 	}
-	w, ok := l.windows[key]
-	if !ok || now.Sub(w.start) > window {
-		l.windows[key] = &limitWindow{start: now, count: 1}
-		return true
-	}
-	if w.count >= max {
-		return false
-	}
-	w.count++
-	return true
+	return fallbackLimiter
 }
 
 // issueFreeTicket creates a free ticket for a signed-in buyer or a guest

@@ -2,6 +2,7 @@ package routes
 
 import (
 	"log"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/websocket/v2"
@@ -24,6 +25,17 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	// cookie-authenticated requests that change state.
 	app.Use(middleware.SecurityHeaders(!cfg.IsDevelopment()))
 	trustedOrigins := middleware.NormalizeOrigins(cfg.CorsAllowedOrigins, cfg.FrontendURL)
+
+	// Rate limits (AUTH-04), shared across instances through Redis. Client
+	// IPs come from the trusted proxy's X-Forwarded-For entry.
+	middleware.SetTrustedProxyHops(cfg.TrustedProxyHops)
+	limiter := middleware.NewRateLimiter(rdb)
+	perIP := func(name string, max int64, window time.Duration) fiber.Handler {
+		return middleware.RateLimit(limiter, middleware.Limit{Name: name, Max: max, Window: window})
+	}
+	perUser := func(name string, max int64, window time.Duration) fiber.Handler {
+		return middleware.RateLimit(limiter, middleware.Limit{Name: name, Max: max, Window: window, Key: middleware.ByUser})
+	}
 
 	emailSvc := &services.EmailService{
 		APIKey:       cfg.ResendAPIKey,
@@ -80,15 +92,15 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	eventAccess := middleware.RequireEventAccess(db)
 
 	// Auth
-	authH := &handlers.AuthHandler{DB: db, Cfg: cfg, Email: emailSvc, Session: sessionCfg}
+	authH := &handlers.AuthHandler{DB: db, Cfg: cfg, Email: emailSvc, Session: sessionCfg, Limiter: limiter}
 	// Invite-only: register needs the token from a superuser's invite link.
-	v1.Post("/auth/register", authH.Register)
-	v1.Get("/auth/invitations/:token", authH.LookupInvitation)
+	v1.Post("/auth/register", perIP("register", 10, time.Hour), authH.Register)
+	v1.Get("/auth/invitations/:token", perIP("invite-lookup", 60, 15*time.Minute), authH.LookupInvitation)
 	// Forgot password: emails a one-time link, then sets the new password.
-	v1.Post("/auth/forgot-password", authH.ForgotPassword)
-	v1.Get("/auth/password-resets/:token", authH.LookupPasswordReset)
-	v1.Post("/auth/reset-password", authH.ResetPassword)
-	v1.Post("/auth/login", authH.Login)
+	v1.Post("/auth/forgot-password", perIP("forgot-password", 10, time.Hour), authH.ForgotPassword)
+	v1.Get("/auth/password-resets/:token", perIP("reset-lookup", 60, 15*time.Minute), authH.LookupPasswordReset)
+	v1.Post("/auth/reset-password", perIP("reset-password", 20, time.Hour), authH.ResetPassword)
+	v1.Post("/auth/login", perIP("login", 30, 15*time.Minute), authH.Login)
 	v1.Post("/auth/logout", authH.Logout)
 	v1.Post("/auth/logout-everywhere", requireSession, authH.LogoutEverywhere)
 	v1.Get("/auth/me", requireSession, authH.Me)
@@ -212,6 +224,7 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 		DB: db, Cfg: cfg, Email: emailSvc,
 		PayPal:   newPayPalService(cfg),
 		Playback: playback,
+		Limiter:  limiter,
 	}
 	app.Post("/api/v1/webhooks/paypal", ticketH.PayPalWebhook)
 	// Find my tickets: emails the tickets to the address (never returns them).
@@ -219,14 +232,14 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	v1.Post("/tickets/lookup", ticketH.LookupByEmail)
 	v1.Get("/tickets/lookup", ticketH.LookupGone)
 	// One-time claim link from the ticket-success page.
-	v1.Get("/tickets/claim/:token", ticketH.Claim)
-	v1.Get("/tickets/enter", ticketH.Enter)
-	v1.Post("/tickets/guest-purchase", ticketH.GuestPurchase)
+	v1.Get("/tickets/claim/:token", perIP("ticket-claim", 120, time.Minute), ticketH.Claim)
+	v1.Get("/tickets/enter", perIP("ticket-enter", 60, time.Minute), ticketH.Enter)
+	v1.Post("/tickets/guest-purchase", perIP("guest-purchase", 30, time.Hour), ticketH.GuestPurchase)
 	v1.Get("/tickets/paypal/complete", ticketH.PayPalComplete)
 	v1.Post("/tickets/purchase", requireSession, ticketH.Purchase)
 	v1.Get("/tickets/mine", requireSession, ticketH.ListMine)
 	// Door-scanner check-in — host only, used by the dashboard's Scan Tickets page
-	v1.Post("/tickets/checkin", requireSession, hostStaff, ticketH.CheckIn)
+	v1.Post("/tickets/checkin", requireSession, perUser("checkin", 120, time.Minute), hostStaff, ticketH.CheckIn)
 
 	// Viewer stream — Redis session locking
 	guard := &services.SessionGuard{RDB: rdb}
@@ -238,7 +251,7 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	// Live chat — ticket-gated registration, Redis-backed history/mutes,
 	// in-process WebSocket fan-out
 	chatH := &handlers.ChatHandler{Hub: handlers.NewChatHub(), DB: db, Cfg: cfg, RDB: rdb, Session: sessionCfg}
-	v1.Post("/events/:id/chat/register", chatH.Register)
+	v1.Post("/events/:id/chat/register", perIP("chat-register", 30, time.Hour), chatH.Register)
 	v1.Use("/events/:id/chat/ws", func(c *fiber.Ctx) error {
 		if websocket.IsWebSocketUpgrade(c) {
 			return c.Next()

@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -17,7 +18,20 @@ type AuthHandler struct {
 	Cfg     *config.Config
 	Email   *services.EmailService
 	Session middleware.SessionConfig
+	// Limiter counts failed sign-ins per account (nil = no lockout).
+	Limiter *middleware.RateLimiter
 }
+
+// Account lockout: after loginMaxFailures wrong passwords for one email in
+// loginFailureWindow, sign-in for that email is refused until the window
+// ends. Counted per email whether or not the account exists, so the lockout
+// itself doesn't reveal which emails are registered.
+const (
+	loginMaxFailures   = 10
+	loginFailureWindow = 15 * time.Minute
+)
+
+func loginFailureKey(email string) string { return "login-fail:" + middleware.HashKey(email) }
 
 type registerRequest struct {
 	// Registration is invite-only: the token from the invite link decides
@@ -122,6 +136,17 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 	}
 	ctx := context.Background()
 
+	failKey := loginFailureKey(req.Email)
+	if h.Limiter.Count(ctx, failKey, loginFailureWindow) >= loginMaxFailures {
+		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
+			"error": "Too many failed sign-in attempts. Try again in 15 minutes, or reset your password.",
+		})
+	}
+	fail := func() error {
+		h.Limiter.Hit(ctx, failKey, loginFailureWindow)
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid credentials"})
+	}
+
 	var userID, email, passwordHash, role, status string
 	err := h.DB.QueryRow(ctx,
 		`SELECT id, email, password_hash, role, status FROM users WHERE email = $1`,
@@ -129,12 +154,13 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 	).Scan(&userID, &email, &passwordHash, &role, &status)
 	if err != nil {
 		_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(req.Password))
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid credentials"})
+		return fail()
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password)); err != nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid credentials"})
+		return fail()
 	}
+	h.Limiter.Reset(ctx, failKey, loginFailureWindow)
 	if status == "pending" {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "your account is waiting for approval; you'll get an email once it's approved"})
 	}
@@ -144,7 +170,7 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 
 	// A new server-side session; the browser gets its ID only as an HttpOnly
 	// cookie, never in the response body or in storage scripts can read.
-	token, expires, err := middleware.CreateSession(ctx, h.DB, userID, c.IP(), c.Get(fiber.HeaderUserAgent))
+	token, expires, err := middleware.CreateSession(ctx, h.DB, userID, middleware.ClientIP(c), c.Get(fiber.HeaderUserAgent))
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to sign in"})
 	}

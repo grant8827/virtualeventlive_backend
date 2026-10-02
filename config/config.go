@@ -12,8 +12,12 @@ type Config struct {
 	JWTSecret   string
 	// AppEnv is "production" (the default when unset), "development" or
 	// "test". Only development/test may run with a weak JWT secret.
-	AppEnv      string
-	FrontendURL string
+	AppEnv string
+	// TrustedProxyHops: reverse proxies in front of the API (Railway's edge
+	// = 1). The client IP is read from that position in X-Forwarded-For.
+	// TRUSTED_PROXY_HOPS overrides; default 1 in production, 0 in dev/test.
+	TrustedProxyHops int
+	FrontendURL      string
 	// Comma-separated list of origins allowed to call the API cross-origin.
 	// Kept separate from FrontendURL, which is reused elsewhere (Stripe
 	// Connect redirect links, email links) as a single URL and would break
@@ -85,9 +89,10 @@ func Load() *Config {
 		RedisURL:    getEnv("REDIS_URL", "redis://localhost:6379"),
 		// No fallback: a missing secret must stop the server (see Validate),
 		// never silently sign tokens with a known value.
-		JWTSecret:   getEnv("JWT_SECRET", ""),
-		AppEnv:      strings.ToLower(strings.TrimSpace(getEnv("APP_ENV", "production"))),
-		FrontendURL: getEnv("FRONTEND_URL", "http://localhost:3000"),
+		JWTSecret:        getEnv("JWT_SECRET", ""),
+		AppEnv:           strings.ToLower(strings.TrimSpace(getEnv("APP_ENV", "production"))),
+		TrustedProxyHops: trustedProxyHops(),
+		FrontendURL:      getEnv("FRONTEND_URL", "http://localhost:3000"),
 		CorsAllowedOrigins: getEnv("CORS_ALLOWED_ORIGINS",
 			"https://virtualeventplus.com,https://www.virtualeventplus.com,https://virtualeventlivefrontend-production.up.railway.app,http://localhost:5173"),
 		Port:                getEnv("PORT", "8080"),
@@ -130,6 +135,17 @@ func Load() *Config {
 		PaypalPartnerAttributionID: getEnv("PAYPAL_PARTNER_ATTRIBUTION_ID", ""),
 		PaypalWebhookID:            getEnv("PAYPAL_WEBHOOK_ID", ""),
 	}
+}
+
+func trustedProxyHops() int {
+	if v, err := strconv.Atoi(os.Getenv("TRUSTED_PROXY_HOPS")); err == nil && v >= 0 {
+		return v
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV"))) {
+	case "development", "test":
+		return 0
+	}
+	return 1
 }
 
 func getEnv(key, fallback string) string {

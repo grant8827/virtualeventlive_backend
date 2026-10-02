@@ -150,7 +150,7 @@ func (h *PayoutSecurityHandler) Unlock(c *fiber.Ctx) error {
 func auditPayoutEvent(db *pgxpool.Pool, c *fiber.Ctx, userID, eventType string) {
 	_, _ = db.Exec(context.Background(),
 		`INSERT INTO payout_security_events (user_id, event_type, ip_address, user_agent)
-		 VALUES ($1, $2, $3, $4)`, userID, eventType, c.IP(), c.Get("User-Agent"),
+		 VALUES ($1, $2, $3, $4)`, userID, eventType, middleware.ClientIP(c), c.Get("User-Agent"),
 	)
 }
 

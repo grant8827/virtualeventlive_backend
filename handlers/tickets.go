@@ -25,6 +25,8 @@ type TicketHandler struct {
 	Email    *services.EmailService
 	PayPal   *services.PayPalService
 	Playback *PlaybackAccess
+	// Limiter: shared (Redis) rate limits; nil uses an in-process fallback.
+	Limiter *middleware.RateLimiter
 }
 
 func (h *TicketHandler) ListMine(c *fiber.Ctx) error {
