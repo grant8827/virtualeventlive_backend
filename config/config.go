@@ -3,12 +3,16 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 )
 
 type Config struct {
 	DatabaseURL string
 	RedisURL    string
 	JWTSecret   string
+	// AppEnv is "production" (the default when unset), "development" or
+	// "test". Only development/test may run with a weak JWT secret.
+	AppEnv      string
 	FrontendURL string
 	// Comma-separated list of origins allowed to call the API cross-origin.
 	// Kept separate from FrontendURL, which is reused elsewhere (Stripe
@@ -62,7 +66,10 @@ func Load() *Config {
 	return &Config{
 		DatabaseURL: getEnv("DATABASE_URL", ""),
 		RedisURL:    getEnv("REDIS_URL", "redis://localhost:6379"),
-		JWTSecret:   getEnv("JWT_SECRET", "change-me-in-production"),
+		// No fallback: a missing secret must stop the server (see Validate),
+		// never silently sign tokens with a known value.
+		JWTSecret:   getEnv("JWT_SECRET", ""),
+		AppEnv:      strings.ToLower(strings.TrimSpace(getEnv("APP_ENV", "production"))),
 		FrontendURL: getEnv("FRONTEND_URL", "http://localhost:3000"),
 		CorsAllowedOrigins: getEnv("CORS_ALLOWED_ORIGINS",
 			"https://virtualeventplus.com,https://www.virtualeventplus.com,https://virtualeventlivefrontend-production.up.railway.app,http://localhost:5173"),

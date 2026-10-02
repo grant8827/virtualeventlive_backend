@@ -23,11 +23,9 @@ func RequirePayoutUnlock(jwtSecret string) fiber.Handler {
 		}
 
 		claims := &PayoutClaims{}
-		token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
-			return []byte(jwtSecret), nil
-		}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
+		err := ParseToken(jwtSecret, tokenStr, AudiencePayout, claims)
 		userID, _ := c.Locals("user_id").(string)
-		if err != nil || !token.Valid || claims.Scope != "payout" || claims.UserID != userID {
+		if err != nil || claims.Scope != "payout" || claims.UserID == "" || claims.UserID != userID {
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "payout access expired; enter your passcode again"})
 		}
 

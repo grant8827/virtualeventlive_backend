@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 
@@ -156,17 +155,12 @@ func auditPayoutEvent(db *pgxpool.Pool, c *fiber.Ctx, userID, eventType string) 
 }
 
 func (h *PayoutSecurityHandler) issueToken(c *fiber.Ctx, userID string) error {
-	now := time.Now()
 	claims := &middleware.PayoutClaims{
-		UserID: userID,
-		Scope:  "payout",
-		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(now.Add(payoutUnlockDuration)),
-			IssuedAt:  jwt.NewNumericDate(now),
-		},
+		UserID:           userID,
+		Scope:            "payout",
+		RegisteredClaims: middleware.NewRegisteredClaims(middleware.AudiencePayout, userID, time.Now().Add(payoutUnlockDuration)),
 	}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	tokenString, err := token.SignedString([]byte(h.Cfg.JWTSecret))
+	tokenString, err := middleware.SignToken(h.Cfg.JWTSecret, claims)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to unlock payouts"})
 	}

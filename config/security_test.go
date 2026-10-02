@@ -1,0 +1,87 @@
+package config
+
+import (
+	"strings"
+	"testing"
+)
+
+const strongSecret = "q7Vx9mT2pL4wZr8Ks1Nb6Hc3Jd5Fg0YeUaXiOoPt"
+
+func TestProductionRefusesMissingSecret(t *testing.T) {
+	c := &Config{AppEnv: "production", JWTSecret: ""}
+	if err := c.Validate(); err == nil {
+		t.Fatal("production must refuse to start without JWT_SECRET")
+	}
+}
+
+func TestUnsetAppEnvIsTreatedAsProduction(t *testing.T) {
+	t.Setenv("APP_ENV", "")
+	t.Setenv("JWT_SECRET", "")
+	c := Load()
+	if c.AppEnv != "production" {
+		t.Fatalf("APP_ENV default = %q, want production", c.AppEnv)
+	}
+	if err := c.Validate(); err == nil {
+		t.Fatal("an unset APP_ENV with no secret must fail closed")
+	}
+}
+
+func TestNoBuiltInFallbackSecret(t *testing.T) {
+	t.Setenv("JWT_SECRET", "")
+	if s := Load().JWTSecret; s != "" {
+		t.Fatal("Load must not supply a default JWT secret")
+	}
+}
+
+func TestProductionRejectsWeakSecrets(t *testing.T) {
+	weak := map[string]string{
+		"old default":         "change-me-in-production",
+		"example placeholder": "change-me-to-a-long-random-secret",
+		"short":               "abc123XYZ",
+		"long but repetitive": strings.Repeat("ab", 20),
+		"generic":             "secret",
+	}
+	for name, s := range weak {
+		if err := ValidateJWTSecret(s, false); err == nil {
+			t.Errorf("%s: production accepted a weak secret", name)
+		}
+	}
+}
+
+func TestProductionAcceptsStrongSecret(t *testing.T) {
+	c := &Config{AppEnv: "production", JWTSecret: strongSecret}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("strong secret rejected: %v", err)
+	}
+	// 64 random hex characters (openssl rand -hex 32) must also pass.
+	hex := "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+	if err := ValidateJWTSecret(hex, false); err != nil {
+		t.Fatalf("hex secret rejected: %v", err)
+	}
+}
+
+func TestDevelopmentAllowsExplicitDevSecretButNotEmpty(t *testing.T) {
+	dev := &Config{AppEnv: "development", JWTSecret: "local-dev-secret"}
+	if err := dev.Validate(); err != nil {
+		t.Fatalf("development should allow an explicit dev secret: %v", err)
+	}
+	empty := &Config{AppEnv: "test", JWTSecret: ""}
+	if err := empty.Validate(); err == nil {
+		t.Fatal("even test mode needs an explicitly configured secret")
+	}
+}
+
+func TestUnknownAppEnvRejected(t *testing.T) {
+	c := &Config{AppEnv: "staging-ish", JWTSecret: strongSecret}
+	if err := c.Validate(); err == nil {
+		t.Fatal("unknown APP_ENV must be rejected")
+	}
+}
+
+func TestValidationErrorNeverContainsSecret(t *testing.T) {
+	secret := "change-me-SUPERSECRETVALUE"
+	err := ValidateJWTSecret(secret, false)
+	if err == nil || strings.Contains(err.Error(), "SUPERSECRETVALUE") {
+		t.Fatalf("error must exist and must not echo the secret: %v", err)
+	}
+}

@@ -29,11 +29,7 @@ func Protected(jwtSecret string) fiber.Handler {
 		tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
 
 		claims := &Claims{}
-		token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
-			return []byte(jwtSecret), nil
-		})
-
-		if err != nil || !token.Valid {
+		if err := ParseToken(jwtSecret, tokenStr, AudienceSession, claims); err != nil || claims.UserID == "" {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 				"error": "invalid or expired token",
 			})

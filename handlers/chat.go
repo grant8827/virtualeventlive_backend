@@ -308,15 +308,11 @@ func (h *ChatHandler) Register(c *fiber.Ctx) error {
 	}
 
 	claims := &chatClaims{
-		EventID:  eventID,
-		ChatName: req.ChatName,
-		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(endsAt.Add(chatTokenGrace)),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
-		},
+		EventID:          eventID,
+		ChatName:         req.ChatName,
+		RegisteredClaims: middleware.NewRegisteredClaims(middleware.AudienceChat, eventID, endsAt.Add(chatTokenGrace)),
 	}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	signed, err := token.SignedString([]byte(h.Cfg.JWTSecret))
+	signed, err := middleware.SignToken(h.Cfg.JWTSecret, claims)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to issue chat token"})
 	}
@@ -334,10 +330,7 @@ func (h *ChatHandler) authenticateHost(eventID, token string) bool {
 		return false
 	}
 	claims := &middleware.Claims{}
-	parsed, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (interface{}, error) {
-		return []byte(h.Cfg.JWTSecret), nil
-	})
-	if err != nil || !parsed.Valid {
+	if err := middleware.ParseToken(h.Cfg.JWTSecret, token, middleware.AudienceSession, claims); err != nil || claims.UserID == "" {
 		return false
 	}
 
@@ -373,10 +366,7 @@ func (h *ChatHandler) authenticateChat(eventID, token string) (string, bool) {
 		return "", false
 	}
 	claims := &chatClaims{}
-	parsed, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (interface{}, error) {
-		return []byte(h.Cfg.JWTSecret), nil
-	})
-	if err != nil || !parsed.Valid || claims.EventID != eventID {
+	if err := middleware.ParseToken(h.Cfg.JWTSecret, token, middleware.AudienceChat, claims); err != nil || claims.EventID != eventID {
 		return "", false
 	}
 	return claims.ChatName, true

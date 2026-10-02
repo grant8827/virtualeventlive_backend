@@ -21,6 +21,14 @@ func main() {
 	}
 
 	cfg := config.Load()
+	// Refuse to start with a missing or weak JWT secret outside
+	// development/test. The error never contains the secret itself.
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("Configuration: %v", err)
+	}
+	if cfg.IsDevelopment() {
+		log.Printf("Running in %s mode — not for production", cfg.AppEnv)
+	}
 
 	db, err := database.ConnectPostgres(cfg.DatabaseURL)
 	if err != nil {

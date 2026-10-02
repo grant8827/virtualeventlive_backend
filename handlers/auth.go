@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 
@@ -138,16 +137,12 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 	}
 
 	claims := &middleware.Claims{
-		UserID: userID,
-		Role:   role,
-		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
-		},
+		UserID:           userID,
+		Role:             role,
+		RegisteredClaims: middleware.NewRegisteredClaims(middleware.AudienceSession, userID, time.Now().Add(24*time.Hour)),
 	}
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	tokenStr, err := token.SignedString([]byte(h.Cfg.JWTSecret))
+	tokenStr, err := middleware.SignToken(h.Cfg.JWTSecret, claims)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to generate token"})
 	}
