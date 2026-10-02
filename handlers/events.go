@@ -197,6 +197,9 @@ func (h *EventHandler) Checkout(c *fiber.Ctx) error {
 }
 
 func (h *EventHandler) WiPayLaunch(c *fiber.Ctx) error {
+	if !h.Cfg.WipayVenueFeeEnabled || h.WiPay == nil {
+		return c.Status(fiber.StatusServiceUnavailable).SendString("WiPay checkout is disabled")
+	}
 	eventID := c.Params("id")
 	state := c.Query("state")
 	if state == "" {
@@ -245,7 +248,13 @@ func (h *EventHandler) WiPayLaunch(c *fiber.Ctx) error {
 	return c.Type("html").SendString(renderHostedCheckoutHTML(checkout))
 }
 
+// WiPayComplete activates an event from WiPay's browser return. The status
+// it reads comes from the URL and is not verified with WiPay, so the route
+// is disabled unless WIPAY_VENUE_FEE_ENABLED is set (refused in production).
 func (h *EventHandler) WiPayComplete(c *fiber.Ctx) error {
+	if !h.Cfg.WipayVenueFeeEnabled {
+		return c.Redirect(h.Cfg.FrontendURL + "/dashboard?venue_paid=0")
+	}
 	eventID := c.Params("id")
 	state := c.Query("state")
 	if state == "" {

@@ -85,3 +85,54 @@ func TestValidationErrorNeverContainsSecret(t *testing.T) {
 		t.Fatalf("error must exist and must not echo the secret: %v", err)
 	}
 }
+
+func fullPayPal(c *Config) {
+	c.PaypalEnabled = true
+	c.PaypalClientID, c.PaypalClientSecret, c.PaypalWebhookID = "id", "secret", "wh"
+	c.PaypalPartnerMerchantID, c.PaypalPartnerAttributionID = "merchant", "attribution"
+	c.PaypalEnvironment = "sandbox"
+}
+
+func TestPayPalOffByDefault(t *testing.T) {
+	t.Setenv("PAYPAL_ENABLED", "")
+	t.Setenv("PAYPAL_CLIENT_ID", "would-otherwise-enable-it")
+	t.Setenv("PAYPAL_CLIENT_SECRET", "x")
+	c := Load()
+	if c.PaypalEnabled {
+		t.Fatal("PayPal must stay off unless PAYPAL_ENABLED=true")
+	}
+	if c.PaypalEnvironment != "" {
+		t.Fatal("PAYPAL_ENVIRONMENT must not silently default to sandbox")
+	}
+}
+
+func TestPayPalRefusesIncompleteOrAmbiguousConfig(t *testing.T) {
+	base := func() *Config { c := &Config{AppEnv: "production", JWTSecret: strongSecret}; fullPayPal(c); return c }
+	if err := base().Validate(); err != nil {
+		t.Fatalf("complete PayPal config rejected: %v", err)
+	}
+	for name, mutate := range map[string]func(*Config){
+		"no webhook id":    func(c *Config) { c.PaypalWebhookID = "" },
+		"no secret":        func(c *Config) { c.PaypalClientSecret = "" },
+		"no partner id":    func(c *Config) { c.PaypalPartnerMerchantID = "" },
+		"no environment":   func(c *Config) { c.PaypalEnvironment = "" },
+		"typo environment": func(c *Config) { c.PaypalEnvironment = "production" },
+	} {
+		c := base()
+		mutate(c)
+		if err := c.Validate(); err == nil {
+			t.Errorf("%s: incomplete PayPal config accepted", name)
+		}
+	}
+}
+
+func TestWiPayVenueFeeRefusedInProduction(t *testing.T) {
+	prod := &Config{AppEnv: "production", JWTSecret: strongSecret, WipayVenueFeeEnabled: true}
+	if err := prod.Validate(); err == nil {
+		t.Fatal("unverifiable WiPay activation must not be enabled in production")
+	}
+	dev := &Config{AppEnv: "development", JWTSecret: "dev", WipayVenueFeeEnabled: true}
+	if err := dev.Validate(); err != nil {
+		t.Fatalf("development may opt in explicitly: %v", err)
+	}
+}

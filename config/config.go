@@ -62,8 +62,15 @@ type Config struct {
 	WipayAPIBaseURL    string
 	WipayAPIKey        string
 	WipayEnvironment   string
+	// WipayVenueFeeEnabled turns on the legacy WiPay booking-fee checkout.
+	// Its return route can't verify payment with WiPay, so it is refused in
+	// production and off by default everywhere.
+	WipayVenueFeeEnabled bool
 
 	// PayPal Commerce Platform multiparty checkout.
+	// PaypalEnabled must be set explicitly (PAYPAL_ENABLED=true) for any
+	// PayPal flow to run; when it is, Validate requires a complete config.
+	PaypalEnabled              bool
 	PaypalClientID             string
 	PaypalClientSecret         string
 	PaypalEnvironment          string
@@ -105,18 +112,20 @@ func Load() *Config {
 		IVSPlaybackAllowOrigin:  getEnv("IVS_PLAYBACK_ALLOW_ORIGIN", ""),
 		S3Region:                getEnv("S3_REGION", getEnv("AWS_REGION", "us-east-1")),
 
-		WipayAccountNumber: getEnv("WIPAY_ACCOUNT_NUMBER", ""),
-		WipayCheckoutURL:   getEnv("WIPAY_CHECKOUT_URL", ""),
-		WipayCountryCode:   getEnv("WIPAY_COUNTRY_CODE", "JM"),
-		WipayCurrency:      getEnv("WIPAY_CURRENCY", "USD"),
-		WipayFeeStructure:  getEnv("WIPAY_FEE_STRUCTURE", "merchant_absorb"),
-		WipayAPIBaseURL:    getEnv("WIPAY_API_BASE_URL", ""),
-		WipayAPIKey:        getEnv("WIPAY_API_KEY", ""),
-		WipayEnvironment:   getEnv("WIPAY_ENVIRONMENT", "sandbox"),
+		WipayAccountNumber:   getEnv("WIPAY_ACCOUNT_NUMBER", ""),
+		WipayCheckoutURL:     getEnv("WIPAY_CHECKOUT_URL", ""),
+		WipayCountryCode:     getEnv("WIPAY_COUNTRY_CODE", "JM"),
+		WipayCurrency:        getEnv("WIPAY_CURRENCY", "USD"),
+		WipayFeeStructure:    getEnv("WIPAY_FEE_STRUCTURE", "merchant_absorb"),
+		WipayAPIBaseURL:      getEnv("WIPAY_API_BASE_URL", ""),
+		WipayAPIKey:          getEnv("WIPAY_API_KEY", ""),
+		WipayEnvironment:     getEnv("WIPAY_ENVIRONMENT", "sandbox"),
+		WipayVenueFeeEnabled: getEnv("WIPAY_VENUE_FEE_ENABLED", "") == "true",
 
 		PaypalClientID:             getEnv("PAYPAL_CLIENT_ID", ""),
 		PaypalClientSecret:         getEnv("PAYPAL_CLIENT_SECRET", ""),
-		PaypalEnvironment:          getEnv("PAYPAL_ENVIRONMENT", "sandbox"),
+		PaypalEnvironment:          strings.ToLower(getEnv("PAYPAL_ENVIRONMENT", "")),
+		PaypalEnabled:              getEnv("PAYPAL_ENABLED", "") == "true",
 		PaypalPartnerMerchantID:    getEnv("PAYPAL_PARTNER_MERCHANT_ID", ""),
 		PaypalPartnerAttributionID: getEnv("PAYPAL_PARTNER_ATTRIBUTION_ID", ""),
 		PaypalWebhookID:            getEnv("PAYPAL_WEBHOOK_ID", ""),

@@ -237,7 +237,12 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	v1.Get("/events/:id/chat/ws", websocket.New(chatH.HandleWS))
 }
 
+// newPayPalService returns an unconfigured (disabled) client unless
+// PAYPAL_ENABLED=true, so every PayPal flow refuses by default.
 func newPayPalService(cfg *config.Config) *services.PayPalService {
+	if !cfg.PaypalEnabled {
+		return &services.PayPalService{}
+	}
 	return &services.PayPalService{
 		ClientID: cfg.PaypalClientID, ClientSecret: cfg.PaypalClientSecret, Environment: cfg.PaypalEnvironment,
 		PartnerMerchantID: cfg.PaypalPartnerMerchantID, PartnerAttributionID: cfg.PaypalPartnerAttributionID,

@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -40,6 +41,40 @@ func (c *Config) Validate() error {
 	// stream unwatchable; refuse to start instead.
 	if c.IVSPlaybackAuthRequired && strings.TrimSpace(c.IVSPlaybackPrivateKey) == "" {
 		return errors.New("IVS_PLAYBACK_AUTH=required but IVS_PLAYBACK_PRIVATE_KEY is not set")
+	}
+	if err := c.validatePayments(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validatePayments keeps incomplete or unverifiable payment integrations
+// from running by accident.
+func (c *Config) validatePayments() error {
+	if c.PaypalEnabled {
+		var missing []string
+		for name, v := range map[string]string{
+			"PAYPAL_CLIENT_ID":              c.PaypalClientID,
+			"PAYPAL_CLIENT_SECRET":          c.PaypalClientSecret,
+			"PAYPAL_WEBHOOK_ID":             c.PaypalWebhookID,
+			"PAYPAL_PARTNER_MERCHANT_ID":    c.PaypalPartnerMerchantID,
+			"PAYPAL_PARTNER_ATTRIBUTION_ID": c.PaypalPartnerAttributionID,
+		} {
+			if strings.TrimSpace(v) == "" {
+				missing = append(missing, name)
+			}
+		}
+		if len(missing) > 0 {
+			sort.Strings(missing)
+			return fmt.Errorf("PAYPAL_ENABLED=true but these are not set: %s", strings.Join(missing, ", "))
+		}
+		// No silent default: production must say which PayPal it talks to.
+		if c.PaypalEnvironment != "live" && c.PaypalEnvironment != "sandbox" {
+			return errors.New("PAYPAL_ENVIRONMENT must be set to live or sandbox when PAYPAL_ENABLED=true")
+		}
+	}
+	if c.WipayVenueFeeEnabled && !c.IsDevelopment() {
+		return errors.New("WIPAY_VENUE_FEE_ENABLED is not allowed in production: WiPay payments can't be verified server-side yet")
 	}
 	return nil
 }
