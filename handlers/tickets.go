@@ -87,50 +87,6 @@ type ticketRow struct {
 	EventExpired     bool       `json:"event_expired"`
 }
 
-// Lookup is a public endpoint — buyers retrieve their tickets by email address.
-// Covers both authenticated-user purchases and guest purchases.
-func (h *TicketHandler) Lookup(c *fiber.Ctx) error {
-	email := c.Query("email")
-	if email == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "email query param is required"})
-	}
-
-	rows, err := h.DB.Query(context.Background(),
-		`SELECT t.id, t.access_token, t.serial_no, t.purchased_at,
-		        t.checked_in_at, t.checked_in_channel,
-		        e.id AS event_id, e.title, e.start_time, e.ticket_type, e.ticket_price,
-		        e.card_bg_from, e.card_bg_to, e.card_bg_image, e.logo_image, e.venue_address,
-		        e.is_active, e.ends_at
-		 FROM tickets t
-		 JOIN events e ON e.id = t.event_id
-		 LEFT JOIN users u ON u.id = t.buyer_id
-		 WHERE u.email = $1 OR t.guest_email = $1
-		 ORDER BY t.purchased_at DESC`,
-		email,
-	)
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "lookup failed"})
-	}
-	defer rows.Close()
-
-	tickets := []ticketRow{}
-	for rows.Next() {
-		var t ticketRow
-		var endsAt time.Time
-		if err := rows.Scan(&t.ID, &t.AccessToken, &t.SerialNo, &t.PurchasedAt,
-			&t.CheckedInAt, &t.CheckedInChannel,
-			&t.EventID, &t.EventTitle, &t.EventStartsAt, &t.TicketType, &t.TicketPrice,
-			&t.CardBgFrom, &t.CardBgTo, &t.CardBgImage, &t.LogoImage, &t.VenueAddress,
-			&t.EventIsActive, &endsAt); err != nil {
-			continue
-		}
-		t.EventExpired = time.Now().After(endsAt)
-		tickets = append(tickets, t)
-	}
-
-	return c.JSON(fiber.Map{"tickets": tickets})
-}
-
 // Enter looks up a ticket by its access_token (the code printed on the ticket),
 // and is the single gate that authorizes watching a stream. Public — no auth
 // required, since guest-purchased tickets have no user account. Used both by
@@ -330,21 +286,19 @@ func (h *TicketHandler) GuestPurchase(c *fiber.Ctx) error {
 
 	// Free tickets do not need a configured payment processor.
 	if ticketPrice == 0 {
-		accessToken := services.GenerateTicketCode()
-
-		if _, err := h.DB.Exec(context.Background(),
-			`INSERT INTO tickets (event_id, buyer_id, guest_email, access_token) VALUES ($1, NULL, $2, $3)`,
-			req.EventID, req.Email, accessToken,
-		); err != nil {
+		accessToken, claim, err := h.issueFreeTicket(context.Background(), req.EventID, nil, &req.Email)
+		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to create ticket"})
 		}
-
 		sendTicketEmail(h.DB, h.Email, req.Email, accessToken)
 
+		// access_token goes only to the purchaser in this response; claim
+		// opens /ticket-success without putting an email in the URL.
 		return c.JSON(fiber.Map{
 			"access_token": accessToken,
 			"event_id":     req.EventID,
 			"event_title":  eventTitle,
+			"claim":        claim,
 		})
 	}
 
@@ -373,6 +327,10 @@ func (h *TicketHandler) GuestPurchase(c *fiber.Ctx) error {
 
 	split := services.CalculateSplit(ticketPrice)
 	stripe.Key = h.Cfg.StripeSecretKey
+	claimToken, claimHash, err := newClaimToken()
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to start checkout"})
+	}
 
 	params := &stripe.CheckoutSessionParams{
 		Mode: stripe.String(string(stripe.CheckoutSessionModePayment)),
@@ -389,7 +347,7 @@ func (h *TicketHandler) GuestPurchase(c *fiber.Ctx) error {
 			},
 		},
 		CustomerEmail: stripe.String(req.Email),
-		SuccessURL:    stripe.String(h.Cfg.FrontendURL + "/ticket-success?email=" + url.QueryEscape(req.Email)),
+		SuccessURL:    stripe.String(h.Cfg.FrontendURL + "/ticket-success?claim=" + url.QueryEscape(claimToken)),
 		CancelURL:     stripe.String(h.Cfg.FrontendURL + "/events/" + req.EventID),
 		Metadata: map[string]string{
 			"type":        "ticket",
@@ -408,6 +366,10 @@ func (h *TicketHandler) GuestPurchase(c *fiber.Ctx) error {
 	s, err := session.New(params)
 	if err != nil {
 		return stripeCheckoutError(c, err)
+	}
+	// The webhook attaches the ticket to this claim once payment completes.
+	if err := insertTicketClaim(context.Background(), h.DB, claimHash, req.EventID, claimTarget{StripeSessionID: &s.ID}); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to start checkout"})
 	}
 
 	return c.JSON(fiber.Map{"checkout_url": s.URL})
@@ -455,12 +417,12 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 		})
 	}
 	if ticketPrice == 0 {
-		accessToken := services.GenerateTicketCode()
-		if _, err := h.DB.Exec(context.Background(), `INSERT INTO tickets (event_id, buyer_id, access_token) VALUES ($1,$2,$3)`, req.EventID, buyerID, accessToken); err != nil {
+		accessToken, claim, err := h.issueFreeTicket(context.Background(), req.EventID, &buyerID, nil)
+		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to create ticket"})
 		}
 		sendTicketEmail(h.DB, h.Email, buyerEmail, accessToken)
-		return c.JSON(fiber.Map{"access_token": accessToken, "event_id": req.EventID})
+		return c.JSON(fiber.Map{"access_token": accessToken, "event_id": req.EventID, "claim": claim})
 	}
 	if payoutGateway == "paypal" {
 		if paypalAccountID == nil || h.PayPal == nil || !h.PayPal.PartnerEnabled() {
@@ -477,6 +439,10 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 
 	split := services.CalculateSplit(ticketPrice)
 	stripe.Key = h.Cfg.StripeSecretKey
+	claimToken, claimHash, err := newClaimToken()
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to start checkout"})
+	}
 
 	params := &stripe.CheckoutSessionParams{
 		Mode: stripe.String(string(stripe.CheckoutSessionModePayment)),
@@ -493,7 +459,7 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 			},
 		},
 		CustomerEmail: stripe.String(buyerEmail),
-		SuccessURL:    stripe.String(h.Cfg.FrontendURL + "/ticket-success?email=" + url.QueryEscape(buyerEmail)),
+		SuccessURL:    stripe.String(h.Cfg.FrontendURL + "/ticket-success?claim=" + url.QueryEscape(claimToken)),
 		CancelURL:     stripe.String(h.Cfg.FrontendURL + "/events/" + req.EventID),
 		Metadata: map[string]string{
 			"type":     "ticket",
@@ -513,12 +479,22 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 	if err != nil {
 		return stripeCheckoutError(c, err)
 	}
+	// The webhook attaches the ticket to this claim once payment completes.
+	if err := insertTicketClaim(context.Background(), h.DB, claimHash, req.EventID, claimTarget{StripeSessionID: &s.ID}); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to start checkout"})
+	}
 
 	return c.JSON(fiber.Map{"checkout_url": s.URL})
 }
 
 func (h *TicketHandler) createPayPalTicketCheckout(c *fiber.Ctx, eventID, eventTitle, buyerEmail string, buyerID *string, merchantID string, amount float64) error {
-	returnURL := strings.TrimRight(c.BaseURL(), "/") + "/api/v1/tickets/paypal/complete"
+	claimToken, claimHash, err := newClaimToken()
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to start checkout"})
+	}
+	// PayPal appends &token=<order id>; the claim rides along so the return
+	// page can show this purchase's ticket without any email in the URL.
+	returnURL := strings.TrimRight(c.BaseURL(), "/") + "/api/v1/tickets/paypal/complete?claim=" + url.QueryEscape(claimToken)
 	split := services.CalculateSplit(amount)
 	order, err := h.PayPal.CreateCheckoutOrder(services.CheckoutOrderRequest{
 		Amount: amount, Description: eventTitle + " — Ticket", Reference: "ticket-" + eventID,
@@ -534,6 +510,9 @@ func (h *TicketHandler) createPayPalTicketCheckout(c *fiber.Ctx, eventID, eventT
 		 VALUES ($1,$2,$3,$4,$5,$6)`, order.ID, eventID, buyerID, buyerEmail, amount, merchantID); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save PayPal checkout"})
 	}
+	if err := insertTicketClaim(context.Background(), h.DB, claimHash, eventID, claimTarget{PayPalOrderID: &order.ID}); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save PayPal checkout"})
+	}
 	return c.JSON(fiber.Map{"checkout_provider": "paypal", "checkout_url": order.ApprovalURL})
 }
 
@@ -545,9 +524,9 @@ func (h *TicketHandler) PayPalComplete(c *fiber.Ctx) error {
 	if orderID == "" || h.PayPal == nil {
 		return c.Redirect(redirect + "?payment=failed")
 	}
-	buyerEmail, _, err := h.completePayPalTicketOrder(context.Background(), orderID)
-	if buyerEmail != "" {
-		redirect += "?email=" + url.QueryEscape(buyerEmail)
+	_, _, err := h.completePayPalTicketOrder(context.Background(), orderID)
+	if claim := strings.TrimSpace(c.Query("claim")); claim != "" {
+		redirect += "?claim=" + url.QueryEscape(claim)
 	}
 	if err != nil {
 		fmt.Printf("paypal ticket completion error: %v\n", err)
@@ -648,6 +627,9 @@ func (h *TicketHandler) completePayPalTicketOrder(ctx context.Context, orderID s
 	if _, err = tx.Exec(ctx,
 		`INSERT INTO ledger_entries (ticket_id,event_id,gross_amount,stripe_fee,platform_fee,host_payout,payout_gateway,payout_status)
 		 VALUES ($1,$2,$3,0,$4,$5,'paypal','paid')`, ticketID, eventID, amount, split.PlatformFee, split.HostShare()); err != nil {
+		return buyerEmail, false, err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE ticket_claims SET ticket_id = $1 WHERE paypal_order_id = $2`, ticketID, orderID); err != nil {
 		return buyerEmail, false, err
 	}
 	if _, err = tx.Exec(ctx, `UPDATE paypal_ticket_orders SET status='completed', ticket_id=$2, completed_at=NOW() WHERE order_id=$1 AND status='created'`, orderID, ticketID); err != nil {

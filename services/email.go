@@ -7,6 +7,7 @@ import (
 	"html"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -118,6 +119,47 @@ func (e *EmailService) SendTicketConfirmation(toEmail string, t TicketEmail) err
 	)
 
 	return e.send(toEmail, "Your ticket for "+t.EventTitle, body)
+}
+
+// SendTicketList answers "Find my tickets": it emails the address its
+// upcoming tickets, so access codes only ever reach the inbox owner.
+func (e *EmailService) SendTicketList(toEmail string, tickets []TicketEmail) error {
+	if !e.Enabled() {
+		fmt.Printf("email: not configured (SMTP_HOST / RESEND_API_KEY) — skipping ticket list email to %s\n", toEmail)
+		return nil
+	}
+	esc := html.EscapeString
+	var items strings.Builder
+	for _, t := range tickets {
+		watchURL := fmt.Sprintf("%s/events/%s/watch?code=%s", e.SiteURL, url.PathEscape(t.EventID), url.QueryEscape(t.AccessCode))
+		door := ""
+		if t.TicketType == "Virtual + Location" {
+			door = fmt.Sprintf(`<p style="color:#8590b0;font-size:12px;margin:6px 0 0">Ticket number for the door: <strong style="color:#fff">#%d</strong></p>`, t.SerialNo)
+		}
+		fmt.Fprintf(&items, `
+    <div style="background:#0f1631;border:1px solid #252e52;border-radius:12px;padding:18px 20px;margin:0 0 14px">
+      <p style="font-size:16px;font-weight:600;margin:0 0 4px">%s</p>
+      <p style="color:#8590b0;font-size:13px;margin:0 0 10px">%s</p>
+      <p style="color:#b3bcd6;font-size:12px;margin:0">Access code: <span style="font-family:monospace;color:#fff;font-size:14px;letter-spacing:0.08em">%s</span></p>%s
+      <a href="%s" style="display:inline-block;background:#0067f9;color:#fff;padding:8px 18px;border-radius:9999px;font-size:13px;font-weight:600;text-decoration:none;margin-top:12px">Watch event</a>
+    </div>`,
+			esc(t.EventTitle),
+			esc(t.StartsAt.Format("Monday, January 2, 2006 at 3:04 PM MST")),
+			esc(t.AccessCode), door, esc(watchURL))
+	}
+
+	body := fmt.Sprintf(`
+<!DOCTYPE html>
+<html>
+<body style="font-family:sans-serif;background:#080d22;color:#fff;padding:40px 20px;margin:0">
+  <div style="max-width:520px;margin:0 auto">
+    <h1 style="font-size:22px;margin-bottom:4px">Your tickets</h1>
+    <p style="color:#8590b0;font-size:14px;margin:0 0 24px">Someone asked us to send the tickets for this email address. If it wasn't you, you can ignore this email.</p>
+%s
+  </div>
+</body>
+</html>`, items.String())
+	return e.send(toEmail, "Your Virtual Event Plus tickets", body)
 }
 
 // SendInvitation emails a registration link to someone a superuser invited.

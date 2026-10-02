@@ -188,7 +188,12 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 		PayPal: newPayPalService(cfg),
 	}
 	app.Post("/api/v1/webhooks/paypal", ticketH.PayPalWebhook)
-	v1.Get("/tickets/lookup", ticketH.Lookup)
+	// Find my tickets: emails the tickets to the address (never returns them).
+	// The old GET ?email= form leaked tickets and is answered with 410.
+	v1.Post("/tickets/lookup", ticketH.LookupByEmail)
+	v1.Get("/tickets/lookup", ticketH.LookupGone)
+	// One-time claim link from the ticket-success page.
+	v1.Get("/tickets/claim/:token", ticketH.Claim)
 	v1.Get("/tickets/enter", ticketH.Enter)
 	v1.Post("/tickets/guest-purchase", ticketH.GuestPurchase)
 	v1.Get("/tickets/paypal/complete", ticketH.PayPalComplete)
