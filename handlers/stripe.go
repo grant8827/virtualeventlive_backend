@@ -2,14 +2,11 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	stripe "github.com/stripe/stripe-go/v82"
 	"github.com/stripe/stripe-go/v82/accountlink"
@@ -24,6 +21,10 @@ type StripeHandler struct {
 	Cfg   *config.Config
 	Email *services.EmailService
 	IVS   *services.IVSService
+
+	// process handles one verified event; nil means processStripeEvent.
+	// Tests replace it to simulate failures and retries.
+	process func(ctx context.Context, event stripe.Event) (webhookOutcome, error)
 }
 
 func (h *StripeHandler) ConnectOnboard(c *fiber.Ctx) error {
@@ -102,51 +103,6 @@ func stripeConnectErrorMsg(c *fiber.Ctx, operation string, err error) error {
 	return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "Stripe Connect error: " + err.Error()})
 }
 
-func (h *StripeHandler) Webhook(c *fiber.Ctx) error {
-	payload := c.Body()
-	sigHeader := c.Get("Stripe-Signature")
-
-	event, err := constructStripeWebhookEvent(payload, sigHeader, h.Cfg.StripeWebhookSecret)
-	if err != nil {
-		// Logged without secret material: the generic 400 response Stripe sees
-		// doesn't distinguish a bad signature from other ConstructEvent failures
-		// (e.g. an account API-version bump the pinned webhook endpoint predates),
-		// so this is the only place that reason surfaces.
-		fmt.Printf("stripe webhook verify failed: %v\n", err)
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid webhook signature"})
-	}
-
-	switch event.Type {
-	case "checkout.session.completed":
-		var sess stripe.CheckoutSession
-		if err := json.Unmarshal(event.Data.Raw, &sess); err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "failed to parse event data"})
-		}
-		switch sess.Metadata["type"] {
-		case "venue_fee":
-			if err := h.handleVenueFeePaid(&sess); err != nil {
-				fmt.Printf("webhook venue_fee error: %v\n", err)
-			}
-		case "ticket":
-			if err := h.handleTicketPurchase(&sess); err != nil {
-				fmt.Printf("webhook ticket purchase error: %v\n", err)
-			}
-		}
-
-	case "account.updated":
-		var acc stripe.Account
-		if err := json.Unmarshal(event.Data.Raw, &acc); err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "failed to parse event data"})
-		}
-		_, _ = h.DB.Exec(context.Background(),
-			`UPDATE connected_accounts SET payout_enabled = $1 WHERE stripe_account_id = $2`,
-			acc.PayoutsEnabled, acc.ID,
-		)
-	}
-
-	return c.Status(fiber.StatusOK).JSON(fiber.Map{"received": true})
-}
-
 // Stripe gives each webhook destination its own signing secret. Test and live
 // destinations can share this public URL but have different secrets, so accept
 // a comma-separated list in STRIPE_WEBHOOK_SECRET rather than forcing one
@@ -168,133 +124,6 @@ func constructStripeWebhookEvent(payload []byte, signature, configuredSecrets st
 		lastErr = fmt.Errorf("no Stripe webhook signing secret configured")
 	}
 	return stripe.Event{}, lastErr
-}
-
-func (h *StripeHandler) handleVenueFeePaid(sess *stripe.CheckoutSession) error {
-	eventID := sess.Metadata["event_id"]
-	if eventID == "" {
-		return nil
-	}
-	var venueFee float64
-	if err := h.DB.QueryRow(context.Background(),
-		`SELECT venue_fee FROM events WHERE id = $1`, eventID,
-	).Scan(&venueFee); err != nil {
-		return fmt.Errorf("event %s: %w", eventID, err)
-	}
-	// Same check as the return page: paid, in full, for this event.
-	if !venueFeeStripeSessionMatches(sess, eventID, venueFee) {
-		return fmt.Errorf("session %s is not a full paid booking fee for event %s", sess.ID, eventID)
-	}
-	return activateVenuePaidEvent(context.Background(), h.DB, h.IVS, eventID)
-}
-
-func (h *StripeHandler) handleTicketPurchase(sess *stripe.CheckoutSession) error {
-	if !stripeTicketSessionPaid(sess) {
-		return fmt.Errorf("session is not a completed USD ticket payment")
-	}
-	eventID := sess.Metadata["event_id"]
-	if eventID == "" {
-		return nil
-	}
-
-	buyerID := sess.Metadata["buyer_id"]
-	guestEmail := sess.Metadata["guest_email"]
-	if buyerID == "" && guestEmail == "" {
-		return nil
-	}
-
-	var eventTitle string
-	var startsAt time.Time
-
-	if err := h.DB.QueryRow(context.Background(),
-		`SELECT title, start_time FROM events WHERE id = $1`,
-		eventID,
-	).Scan(&eventTitle, &startsAt); err != nil {
-		return fmt.Errorf("fetch event: %w", err)
-	}
-	ticketPrice := float64(sess.AmountTotal) / 100
-
-	// Determine buyer email
-	buyerEmail := guestEmail
-	if buyerID != "" {
-		var userEmail string
-		_ = h.DB.QueryRow(context.Background(),
-			`SELECT email FROM users WHERE id = $1`, buyerID,
-		).Scan(&userEmail)
-		if userEmail != "" {
-			buyerEmail = userEmail
-		}
-	}
-
-	tx, err := h.DB.Begin(context.Background())
-	if err != nil {
-		return fmt.Errorf("begin ticket transaction: %w", err)
-	}
-	defer tx.Rollback(context.Background())
-
-	accessToken := services.GenerateTicketCode()
-
-	var ticketID string
-	var insertErr error
-	if buyerID != "" {
-		insertErr = tx.QueryRow(context.Background(),
-			`INSERT INTO tickets (event_id, buyer_id, access_token, stripe_checkout_session_id)
-			 VALUES ($1, $2, $3, $4) ON CONFLICT (stripe_checkout_session_id) DO NOTHING RETURNING id`,
-			eventID, buyerID, accessToken, sess.ID,
-		).Scan(&ticketID)
-	} else {
-		insertErr = tx.QueryRow(context.Background(),
-			`INSERT INTO tickets (event_id, buyer_id, guest_email, access_token, stripe_checkout_session_id)
-			 VALUES ($1, NULL, $2, $3, $4) ON CONFLICT (stripe_checkout_session_id) DO NOTHING RETURNING id`,
-			eventID, guestEmail, accessToken, sess.ID,
-		).Scan(&ticketID)
-	}
-	if errors.Is(insertErr, pgx.ErrNoRows) {
-		return nil // Stripe retried an already-processed Checkout Session.
-	}
-	if insertErr != nil {
-		return fmt.Errorf("insert ticket: %w", insertErr)
-	}
-
-	var payoutGateway string
-	_ = h.DB.QueryRow(context.Background(),
-		`SELECT ca.payout_gateway FROM connected_accounts ca
-		 JOIN events e ON e.host_id = ca.user_id WHERE e.id = $1`,
-		eventID,
-	).Scan(&payoutGateway)
-	if payoutGateway == "" {
-		payoutGateway = "stripe"
-	}
-	// Stripe hosts are paid via destination charge at checkout, so their
-	// entries settle immediately. WiPay/PayPal hosts wait for a manual payout.
-	payoutStatus := "paid"
-	if payoutGateway != "stripe" {
-		payoutStatus = "pending"
-	}
-
-	split := services.CalculateSplit(ticketPrice)
-	// Stripe-connected hosts are paid via a destination charge: Stripe
-	// transfers gross-minus-platform-fee directly to them and absorbs its own
-	// processing fee from the platform's kept application fee. WiPay/PayPal
-	// hosts are paid manually out of the platform's balance, so that payout
-	// nets out an estimated processing-fee reserve instead.
-	hostPayout := split.HostPayout
-	if payoutGateway == "stripe" {
-		hostPayout = split.StripeDestinationPayout()
-	}
-	if _, err := tx.Exec(context.Background(),
-		`INSERT INTO ledger_entries (ticket_id, event_id, gross_amount, stripe_fee, platform_fee, host_payout, payout_gateway, payout_status)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-		ticketID, eventID, split.GrossAmount, split.StripeFee, split.PlatformFee, hostPayout, payoutGateway, payoutStatus,
-	); err != nil {
-		return fmt.Errorf("insert ledger: %w", err)
-	}
-	if err := tx.Commit(context.Background()); err != nil {
-		return fmt.Errorf("commit ticket transaction: %w", err)
-	}
-
-	sendTicketEmail(h.DB, h.Email, buyerEmail, accessToken)
-	return nil
 }
 
 func stripeTicketSessionPaid(sess *stripe.CheckoutSession) bool {
