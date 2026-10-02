@@ -130,10 +130,11 @@ func normalizeName(name string) string {
 }
 
 type ChatHandler struct {
-	Hub *ChatHub
-	DB  *pgxpool.Pool
-	Cfg *config.Config
-	RDB *redis.Client
+	Hub     *ChatHub
+	DB      *pgxpool.Pool
+	Cfg     *config.Config
+	RDB     *redis.Client
+	Session middleware.SessionConfig
 }
 
 // ─── Redis-backed history & mutes ──────────────────────────────────────────
@@ -322,20 +323,18 @@ func (h *ChatHandler) Register(c *fiber.Ctx) error {
 
 // ─── WebSocket ──────────────────────────────────────────────────────────────
 
-// authenticateHost checks a JWT (passed as ?token=) belongs to the actual
+// authenticateHost checks the sign-in session cookie (sent automatically with
+// the WebSocket handshake — no token in the URL) belongs to the actual
 // host of this event, or a member of their team — anyone else, including
 // other hosts, connects as a regular viewer.
-func (h *ChatHandler) authenticateHost(eventID, token string) bool {
-	if token == "" {
-		return false
-	}
-	claims := &middleware.Claims{}
-	if err := middleware.ParseToken(h.Cfg.JWTSecret, token, middleware.AudienceSession, claims); err != nil || claims.UserID == "" {
+func (h *ChatHandler) authenticateHost(eventID, sessionToken string) bool {
+	session, err := middleware.LookupSession(context.Background(), h.DB, sessionToken)
+	if err != nil || session.Status != "active" {
 		return false
 	}
 
 	// Staff and admins on the host's team moderate as the host.
-	acct, err := middleware.ResolveAccount(context.Background(), h.DB, claims.UserID)
+	acct, err := middleware.ResolveAccount(context.Background(), h.DB, session.UserID)
 	if err != nil || !acct.Active || acct.TeamRole == "" {
 		return false
 	}
@@ -354,7 +353,7 @@ func (h *ChatHandler) authenticateHost(eventID, token string) bool {
 	}
 	// Staff only moderate events assigned to them.
 	if acct.TeamRole == middleware.TeamStaff {
-		return assignedTo != nil && *assignedTo == claims.UserID
+		return assignedTo != nil && *assignedTo == session.UserID
 	}
 	return true
 }
@@ -379,7 +378,7 @@ func (h *ChatHandler) authenticateChat(eventID, token string) (string, bool) {
 // moderation privileges (delete/mute) and has its messages flagged is_host.
 func (h *ChatHandler) HandleWS(c *websocket.Conn) {
 	eventID := c.Params("id")
-	isHost := h.authenticateHost(eventID, c.Query("token"))
+	isHost := h.authenticateHost(eventID, c.Cookies(h.Session.CookieName()))
 
 	var name string
 	if isHost {

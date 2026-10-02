@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -14,9 +13,10 @@ import (
 )
 
 type AuthHandler struct {
-	DB    *pgxpool.Pool
-	Cfg   *config.Config
-	Email *services.EmailService
+	DB      *pgxpool.Pool
+	Cfg     *config.Config
+	Email   *services.EmailService
+	Session middleware.SessionConfig
 }
 
 type registerRequest struct {
@@ -111,18 +111,24 @@ func (h *AuthHandler) Register(c *fiber.Ctx) error {
 	})
 }
 
+// dummyPasswordHash is compared against when the email is unknown, so a
+// failed sign-in takes the same time whether or not the account exists.
+var dummyPasswordHash, _ = bcrypt.GenerateFromPassword([]byte("not-a-real-password"), bcrypt.DefaultCost)
+
 func (h *AuthHandler) Login(c *fiber.Ctx) error {
 	var req loginRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
 	}
+	ctx := context.Background()
 
-	var userID, passwordHash, role, status string
-	err := h.DB.QueryRow(context.Background(),
-		`SELECT id, password_hash, role, status FROM users WHERE email = $1`,
+	var userID, email, passwordHash, role, status string
+	err := h.DB.QueryRow(ctx,
+		`SELECT id, email, password_hash, role, status FROM users WHERE email = $1`,
 		req.Email,
-	).Scan(&userID, &passwordHash, &role, &status)
+	).Scan(&userID, &email, &passwordHash, &role, &status)
 	if err != nil {
+		_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(req.Password))
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid credentials"})
 	}
 
@@ -136,41 +142,41 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "this account has been suspended"})
 	}
 
-	claims := &middleware.Claims{
-		UserID:           userID,
-		Role:             role,
-		RegisteredClaims: middleware.NewRegisteredClaims(middleware.AudienceSession, userID, time.Now().Add(24*time.Hour)),
-	}
-
-	tokenStr, err := middleware.SignToken(h.Cfg.JWTSecret, claims)
+	// A new server-side session; the browser gets its ID only as an HttpOnly
+	// cookie, never in the response body or in storage scripts can read.
+	token, expires, err := middleware.CreateSession(ctx, h.DB, userID, c.IP(), c.Get(fiber.HeaderUserAgent))
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to generate token"})
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to sign in"})
 	}
-
-	c.Cookie(&fiber.Cookie{
-		Name:     "auth_token",
-		Value:    tokenStr,
-		HTTPOnly: true,
-		SameSite: "Lax",
-		MaxAge:   int((24 * time.Hour).Seconds()),
-	})
+	middleware.SetSessionCookie(c, h.Session, token, expires)
 
 	return c.JSON(fiber.Map{
 		"id":    userID,
-		"email": req.Email,
+		"email": email,
 		"role":  role,
-		"token": tokenStr,
 	})
 }
 
+// Logout revokes the current session on the server and clears the cookie.
 func (h *AuthHandler) Logout(c *fiber.Ctx) error {
-	c.Cookie(&fiber.Cookie{
-		Name:    "auth_token",
-		Value:   "",
-		MaxAge:  -1,
-		Expires: time.Now().Add(-time.Hour),
-	})
+	if token := c.Cookies(h.Session.CookieName()); token != "" {
+		if s, err := middleware.LookupSession(context.Background(), h.DB, token); err == nil {
+			_ = middleware.RevokeSession(context.Background(), h.DB, s.SessionID, "logout")
+		}
+	}
+	middleware.ClearSessionCookie(c, h.Session)
 	return c.JSON(fiber.Map{"message": "logged out"})
+}
+
+// LogoutEverywhere revokes every session of the signed-in user, including
+// this one.
+func (h *AuthHandler) LogoutEverywhere(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(string)
+	if _, err := middleware.RevokeUserSessions(context.Background(), h.DB, userID, "logout_everywhere", ""); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to sign out"})
+	}
+	middleware.ClearSessionCookie(c, h.Session)
+	return c.JSON(fiber.Map{"message": "signed out on all devices"})
 }
 
 func (h *AuthHandler) Me(c *fiber.Ctx) error {
@@ -288,6 +294,9 @@ func (h *AuthHandler) ChangePassword(c *fiber.Ctx) error {
 	); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to update password"})
 	}
+	// Sign out every other device; this one stays signed in.
+	currentSession, _ := c.Locals("session_id").(string)
+	_, _ = middleware.RevokeUserSessions(context.Background(), h.DB, userID, "password_changed", currentSession)
 
 	return c.JSON(fiber.Map{"message": "password updated"})
 }

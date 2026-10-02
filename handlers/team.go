@@ -185,6 +185,11 @@ func (h *TeamHandler) Update(c *fiber.Ctx) error {
 		}
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "user not found"})
 	}
+	// A role, status, email or password change takes effect everywhere at
+	// once: the member's existing sessions end and they sign in again.
+	if req.Role != nil || req.Status != nil || req.Email != nil || passwordHash != nil {
+		_, _ = middleware.RevokeUserSessions(context.Background(), h.DB, m.ID, "account_changed_by_host", "")
+	}
 	return c.JSON(m)
 }
 

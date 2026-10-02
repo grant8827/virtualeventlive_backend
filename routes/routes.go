@@ -15,6 +15,16 @@ import (
 )
 
 func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) {
+	// Sign-in is a server-side session in an HttpOnly cookie (AUTH-03).
+	// Secure everywhere except local development over plain http.
+	sessionCfg := middleware.SessionConfig{Secure: !cfg.IsDevelopment()}
+	requireSession := middleware.RequireSession(db, sessionCfg)
+
+	// Defensive headers on every response, and the CSRF origin check for
+	// cookie-authenticated requests that change state.
+	app.Use(middleware.SecurityHeaders(!cfg.IsDevelopment()))
+	trustedOrigins := middleware.NormalizeOrigins(cfg.CorsAllowedOrigins, cfg.FrontendURL)
+
 	emailSvc := &services.EmailService{
 		APIKey:       cfg.ResendAPIKey,
 		FromEmail:    cfg.FromEmail,
@@ -59,7 +69,7 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	stripeH := &handlers.StripeHandler{DB: db, Cfg: cfg, Email: emailSvc, IVS: ivsSvc}
 	app.Post("/api/v1/webhooks/stripe", stripeH.Webhook)
 
-	v1 := app.Group("/api/v1")
+	v1 := app.Group("/api/v1", middleware.RequireTrustedOrigin(trustedOrigins, sessionCfg.CookieName()))
 
 	// Host dashboard access. The owner always passes; team members added
 	// under Add User pass according to their role. Staff get Go Live, Chat,
@@ -70,7 +80,7 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	eventAccess := middleware.RequireEventAccess(db)
 
 	// Auth
-	authH := &handlers.AuthHandler{DB: db, Cfg: cfg, Email: emailSvc}
+	authH := &handlers.AuthHandler{DB: db, Cfg: cfg, Email: emailSvc, Session: sessionCfg}
 	// Invite-only: register needs the token from a superuser's invite link.
 	v1.Post("/auth/register", authH.Register)
 	v1.Get("/auth/invitations/:token", authH.LookupInvitation)
@@ -80,9 +90,10 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	v1.Post("/auth/reset-password", authH.ResetPassword)
 	v1.Post("/auth/login", authH.Login)
 	v1.Post("/auth/logout", authH.Logout)
-	v1.Get("/auth/me", middleware.Protected(cfg.JWTSecret), authH.Me)
-	v1.Put("/auth/profile", middleware.Protected(cfg.JWTSecret), authH.UpdateProfile)
-	v1.Post("/auth/change-password", middleware.Protected(cfg.JWTSecret), authH.ChangePassword)
+	v1.Post("/auth/logout-everywhere", requireSession, authH.LogoutEverywhere)
+	v1.Get("/auth/me", requireSession, authH.Me)
+	v1.Put("/auth/profile", requireSession, authH.UpdateProfile)
+	v1.Post("/auth/change-password", requireSession, authH.ChangePassword)
 
 	// Events
 	eventH := &handlers.EventHandler{
@@ -108,9 +119,9 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	// Some hosted-checkout handoffs submit the launch URL as a form POST.
 	// The signed state still authorizes the request in either form.
 	v1.Post("/events/:id/wipay/launch", eventH.WiPayLaunch)
-	v1.Post("/events", middleware.Protected(cfg.JWTSecret), hostAdmin, eventH.Create)
-	v1.Get("/events", middleware.Protected(cfg.JWTSecret), hostStaff, eventH.ListByHost)
-	v1.Post("/events/:id/checkout", middleware.Protected(cfg.JWTSecret), hostAdmin, eventH.Checkout)
+	v1.Post("/events", requireSession, hostAdmin, eventH.Create)
+	v1.Get("/events", requireSession, hostStaff, eventH.ListByHost)
+	v1.Post("/events/:id/checkout", requireSession, hostAdmin, eventH.Checkout)
 	v1.Get("/events/:id/wipay/complete", eventH.WiPayComplete)
 	// WiPay returns hosted-checkout results as a form POST. Keep GET as well
 	// for browser redirects and manually opened return links.
@@ -118,41 +129,41 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	v1.Get("/events/:id/paypal/complete", eventH.PayPalComplete)
 	// Booking fee: Stripe sends the host back here after checkout.
 	v1.Get("/events/:id/stripe/complete", eventH.StripeComplete)
-	v1.Patch("/events/:id/ticket", middleware.Protected(cfg.JWTSecret), hostStaff, eventAccess, eventH.TicketSetup)
-	v1.Post("/events/:id/bypass-activate", middleware.Protected(cfg.JWTSecret), hostAdmin, eventH.BypassActivate)
-	v1.Delete("/events/:id", middleware.Protected(cfg.JWTSecret), hostAdmin, eventH.Delete)
+	v1.Patch("/events/:id/ticket", requireSession, hostStaff, eventAccess, eventH.TicketSetup)
+	v1.Post("/events/:id/bypass-activate", requireSession, hostAdmin, eventH.BypassActivate)
+	v1.Delete("/events/:id", requireSession, hostAdmin, eventH.Delete)
 
 	// Private S3-backed event images. Media reads are public because ticket
 	// cards and flyers are public promotional assets; the bucket stays private.
 	imageH := &handlers.ImageHandler{DB: db, Storage: s3Storage}
 	v1.Get("/media/events/:id/:kind", imageH.Get)
-	v1.Post("/events/:id/images/:kind", middleware.Protected(cfg.JWTSecret), hostStaff, eventAccess, imageH.Upload)
-	v1.Delete("/events/:id/images/:kind", middleware.Protected(cfg.JWTSecret), hostStaff, eventAccess, imageH.Delete)
+	v1.Post("/events/:id/images/:kind", requireSession, hostStaff, eventAccess, imageH.Upload)
+	v1.Delete("/events/:id/images/:kind", requireSession, hostStaff, eventAccess, imageH.Delete)
 
 	// Advertisements
 	adH := &handlers.AdvertisementHandler{DB: db}
 	v1.Get("/advertisements", adH.ListPublic)
-	v1.Get("/advertisements/mine", middleware.Protected(cfg.JWTSecret), hostStaff, adH.ListByHost)
-	v1.Post("/advertisements", middleware.Protected(cfg.JWTSecret), hostStaff, adH.Create)
-	v1.Put("/advertisements/:id", middleware.Protected(cfg.JWTSecret), hostStaff, adH.Update)
-	v1.Delete("/advertisements/:id", middleware.Protected(cfg.JWTSecret), hostStaff, adH.Delete)
+	v1.Get("/advertisements/mine", requireSession, hostStaff, adH.ListByHost)
+	v1.Post("/advertisements", requireSession, hostStaff, adH.Create)
+	v1.Put("/advertisements/:id", requireSession, hostStaff, adH.Update)
+	v1.Delete("/advertisements/:id", requireSession, hostStaff, adH.Delete)
 
 	// Stream credentials — host only, returns IVS ingest URL + stream key
 	credH := &handlers.StreamCredentialsHandler{DB: db, IVS: ivsSvc, Playback: playback}
-	v1.Get("/events/:id/stream-credentials", middleware.Protected(cfg.JWTSecret), hostStaff, eventAccess, credH.Get)
-	v1.Post("/events/:id/reprovision-stream", middleware.Protected(cfg.JWTSecret), hostStaff, eventAccess, credH.Reprovision)
+	v1.Get("/events/:id/stream-credentials", requireSession, hostStaff, eventAccess, credH.Get)
+	v1.Post("/events/:id/reprovision-stream", requireSession, hostStaff, eventAccess, credH.Reprovision)
 	// Live viewer count for the Go Live page
-	v1.Get("/events/:id/viewers", middleware.Protected(cfg.JWTSecret), hostStaff, eventAccess, credH.Viewers)
+	v1.Get("/events/:id/viewers", requireSession, hostStaff, eventAccess, credH.Viewers)
 	// Public — ticket holders poll this to know if the host is live right now
 	v1.Get("/events/:id/stream-status", credH.Status)
 
 	// Payouts — host onboarding across Stripe Connect, WiPay, and PayPal
 	payoutAuth := middleware.RequirePayoutUnlock(cfg.JWTSecret)
 	payoutSecurityH := &handlers.PayoutSecurityHandler{DB: db, Cfg: cfg}
-	v1.Get("/connect/security/status", middleware.Protected(cfg.JWTSecret), hostAdmin, payoutSecurityH.Status)
-	v1.Post("/connect/security/passcode", middleware.Protected(cfg.JWTSecret), hostAdmin, payoutSecurityH.Create)
-	v1.Post("/connect/security/unlock", middleware.Protected(cfg.JWTSecret), hostAdmin, payoutSecurityH.Unlock)
-	v1.Post("/connect/onboard", middleware.Protected(cfg.JWTSecret), hostAdmin, payoutAuth, stripeH.ConnectOnboard)
+	v1.Get("/connect/security/status", requireSession, hostAdmin, payoutSecurityH.Status)
+	v1.Post("/connect/security/passcode", requireSession, hostAdmin, payoutSecurityH.Create)
+	v1.Post("/connect/security/unlock", requireSession, hostAdmin, payoutSecurityH.Unlock)
+	v1.Post("/connect/onboard", requireSession, hostAdmin, payoutAuth, stripeH.ConnectOnboard)
 	payoutH := &handlers.PayoutHandler{
 		DB:  db,
 		Cfg: cfg,
@@ -163,26 +174,26 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 		},
 		PayPal: newPayPalService(cfg),
 	}
-	v1.Get("/connect/status", middleware.Protected(cfg.JWTSecret), hostAdmin, payoutAuth, payoutH.Status)
-	v1.Post("/connect/wipay", middleware.Protected(cfg.JWTSecret), hostAdmin, payoutAuth, payoutH.ConnectWiPay)
-	v1.Post("/connect/paypal", middleware.Protected(cfg.JWTSecret), hostAdmin, payoutAuth, payoutH.ConnectPayPal)
+	v1.Get("/connect/status", requireSession, hostAdmin, payoutAuth, payoutH.Status)
+	v1.Post("/connect/wipay", requireSession, hostAdmin, payoutAuth, payoutH.ConnectWiPay)
+	v1.Post("/connect/paypal", requireSession, hostAdmin, payoutAuth, payoutH.ConnectPayPal)
 	v1.Get("/connect/paypal/complete", payoutH.CompletePayPal)
-	v1.Post("/connect/activate", middleware.Protected(cfg.JWTSecret), hostAdmin, payoutAuth, payoutH.Activate)
-	v1.Post("/connect/deactivate", middleware.Protected(cfg.JWTSecret), hostAdmin, payoutAuth, payoutH.Deactivate)
-	v1.Get("/connect/balance", middleware.Protected(cfg.JWTSecret), hostAdmin, payoutAuth, payoutH.Balance)
-	v1.Post("/connect/payout", middleware.Protected(cfg.JWTSecret), hostAdmin, payoutAuth, payoutH.Payout)
+	v1.Post("/connect/activate", requireSession, hostAdmin, payoutAuth, payoutH.Activate)
+	v1.Post("/connect/deactivate", requireSession, hostAdmin, payoutAuth, payoutH.Deactivate)
+	v1.Get("/connect/balance", requireSession, hostAdmin, payoutAuth, payoutH.Balance)
+	v1.Post("/connect/payout", requireSession, hostAdmin, payoutAuth, payoutH.Payout)
 
 	// Team — the Add User page: staff/admin logins on this host account
 	teamH := &handlers.TeamHandler{DB: db}
-	v1.Get("/team", middleware.Protected(cfg.JWTSecret), hostAdmin, teamH.List)
-	v1.Post("/team", middleware.Protected(cfg.JWTSecret), hostAdmin, teamH.Create)
-	v1.Patch("/team/:id", middleware.Protected(cfg.JWTSecret), hostAdmin, teamH.Update)
-	v1.Delete("/team/:id", middleware.Protected(cfg.JWTSecret), hostAdmin, teamH.Delete)
+	v1.Get("/team", requireSession, hostAdmin, teamH.List)
+	v1.Post("/team", requireSession, hostAdmin, teamH.Create)
+	v1.Patch("/team/:id", requireSession, hostAdmin, teamH.Update)
+	v1.Delete("/team/:id", requireSession, hostAdmin, teamH.Delete)
 
 	// Superuser — platform dashboard: analytics and control over every
 	// user and event. Superusers are created with `go run ./cmd/superuser`.
 	superH := &handlers.SuperuserHandler{DB: db, IVS: ivsSvc, Email: emailSvc}
-	su := v1.Group("/superuser", middleware.Protected(cfg.JWTSecret), middleware.RequireSuperuser(db))
+	su := v1.Group("/superuser", requireSession, middleware.RequireSuperuser(db))
 	su.Get("/overview", superH.Overview)
 	su.Get("/users", superH.ListUsers)
 	su.Patch("/users/:id", superH.UpdateUser)
@@ -212,21 +223,21 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	v1.Get("/tickets/enter", ticketH.Enter)
 	v1.Post("/tickets/guest-purchase", ticketH.GuestPurchase)
 	v1.Get("/tickets/paypal/complete", ticketH.PayPalComplete)
-	v1.Post("/tickets/purchase", middleware.Protected(cfg.JWTSecret), ticketH.Purchase)
-	v1.Get("/tickets/mine", middleware.Protected(cfg.JWTSecret), ticketH.ListMine)
+	v1.Post("/tickets/purchase", requireSession, ticketH.Purchase)
+	v1.Get("/tickets/mine", requireSession, ticketH.ListMine)
 	// Door-scanner check-in — host only, used by the dashboard's Scan Tickets page
-	v1.Post("/tickets/checkin", middleware.Protected(cfg.JWTSecret), hostStaff, ticketH.CheckIn)
+	v1.Post("/tickets/checkin", requireSession, hostStaff, ticketH.CheckIn)
 
 	// Viewer stream — Redis session locking
 	guard := &services.SessionGuard{RDB: rdb}
 	streamH := &handlers.StreamHandler{DB: db, Guard: guard, Playback: playback}
-	v1.Post("/stream/watch", middleware.Protected(cfg.JWTSecret), streamH.Watch)
-	v1.Post("/stream/heartbeat", middleware.Protected(cfg.JWTSecret), streamH.Heartbeat)
-	v1.Post("/stream/release", middleware.Protected(cfg.JWTSecret), streamH.Release)
+	v1.Post("/stream/watch", requireSession, streamH.Watch)
+	v1.Post("/stream/heartbeat", requireSession, streamH.Heartbeat)
+	v1.Post("/stream/release", requireSession, streamH.Release)
 
 	// Live chat — ticket-gated registration, Redis-backed history/mutes,
 	// in-process WebSocket fan-out
-	chatH := &handlers.ChatHandler{Hub: handlers.NewChatHub(), DB: db, Cfg: cfg, RDB: rdb}
+	chatH := &handlers.ChatHandler{Hub: handlers.NewChatHub(), DB: db, Cfg: cfg, RDB: rdb, Session: sessionCfg}
 	v1.Post("/events/:id/chat/register", chatH.Register)
 	v1.Use("/events/:id/chat/ws", func(c *fiber.Ctx) error {
 		if websocket.IsWebSocketUpgrade(c) {

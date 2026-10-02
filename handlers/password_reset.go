@@ -8,6 +8,8 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"golang.org/x/crypto/bcrypt"
+
+	"vertualeventlive/backend/middleware"
 )
 
 // Forgot-password flow. Tokens reuse the invitation helpers: a random
@@ -144,5 +146,7 @@ func (h *AuthHandler) ResetPassword(c *fiber.Ctx) error {
 	if err := tx.Commit(ctx); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to reset password"})
 	}
+	// Whoever might have been signed in with the old password is signed out.
+	_, _ = middleware.RevokeUserSessions(ctx, h.DB, userID, "password_reset", "")
 	return c.JSON(fiber.Map{"message": "Your password has been reset. You can sign in now."})
 }

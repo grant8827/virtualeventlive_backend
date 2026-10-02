@@ -53,7 +53,7 @@ func ResolveAccount(ctx context.Context, db *pgxpool.Pool, userID string) (Accou
 	return acct, nil
 }
 
-// HostAccount replaces RequireRole("host") on dashboard routes. The owner is
+// HostAccount guards host dashboard routes (after RequireSession). The owner is
 // always let through; team members only when their role is in allowed. For
 // members, Locals("user_id") is swapped to the owner's ID so existing
 // handlers scope their queries to the owner's account unchanged; the real

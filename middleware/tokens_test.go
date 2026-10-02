@@ -11,70 +11,57 @@ import (
 
 const testSecret = "q7Vx9mT2pL4wZr8Ks1Nb6Hc3Jd5Fg0YeUaXiOoPt"
 
-func sessionToken(t *testing.T, secret string, mutate func(*Claims)) string {
+// Chat and payout tokens are the JWTs the API still signs. These cover the
+// forged/invalid cases for them (sign-in sessions are covered in
+// session_test.go).
+
+type testClaims struct {
+	EventID string `json:"event_id"`
+	jwt.RegisteredClaims
+}
+
+func chatToken(t *testing.T, secret string, method jwt.SigningMethod, mutate func(*testClaims)) string {
 	t.Helper()
-	c := &Claims{UserID: "user-1", Role: "host",
-		RegisteredClaims: NewRegisteredClaims(AudienceSession, "user-1", time.Now().Add(time.Hour))}
+	c := &testClaims{EventID: "event-1", RegisteredClaims: NewRegisteredClaims(AudienceChat, "event-1", time.Now().Add(time.Hour))}
 	if mutate != nil {
 		mutate(c)
 	}
-	s, err := jwt.NewWithClaims(jwt.SigningMethodHS256, c).SignedString([]byte(secret))
+	var key any = []byte(secret)
+	if method == jwt.SigningMethodNone {
+		key = jwt.UnsafeAllowNoneSignatureType
+	}
+	s, err := jwt.NewWithClaims(method, c).SignedString(key)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return s
 }
 
-// protectedStatus runs a request through Protected and returns the status.
-func protectedStatus(t *testing.T, token string) int {
-	t.Helper()
-	app := fiber.New()
-	app.Get("/x", Protected(testSecret), func(c *fiber.Ctx) error { return c.SendStatus(200) })
-	req := httptest.NewRequest("GET", "/x", nil)
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	resp, err := app.Test(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return resp.StatusCode
-}
-
-func TestValidSessionTokenAccepted(t *testing.T) {
-	if got := protectedStatus(t, sessionToken(t, testSecret, nil)); got != 200 {
-		t.Fatalf("valid token: got %d", got)
+func TestValidChatTokenAccepted(t *testing.T) {
+	if err := ParseToken(testSecret, chatToken(t, testSecret, jwt.SigningMethodHS256, nil), AudienceChat, &testClaims{}); err != nil {
+		t.Fatalf("valid token rejected: %v", err)
 	}
 }
 
 func TestForgedAndInvalidTokensRejected(t *testing.T) {
-	noneToken, _ := jwt.NewWithClaims(jwt.SigningMethodNone, &Claims{UserID: "user-1", Role: "superuser",
-		RegisteredClaims: NewRegisteredClaims(AudienceSession, "user-1", time.Now().Add(time.Hour))}).
-		SignedString(jwt.UnsafeAllowNoneSignatureType)
-	hs512, _ := jwt.NewWithClaims(jwt.SigningMethodHS512, &Claims{UserID: "user-1",
-		RegisteredClaims: NewRegisteredClaims(AudienceSession, "user-1", time.Now().Add(time.Hour))}).
-		SignedString([]byte(testSecret))
-	valid := sessionToken(t, testSecret, nil)
-
+	hs := jwt.SigningMethodHS256
+	valid := chatToken(t, testSecret, hs, nil)
 	cases := map[string]string{
-		"no token":           "",
 		"garbage":            "not.a.jwt",
-		"wrong secret":       sessionToken(t, "a-completely-different-secret-value-123", nil),
-		"alg none":           noneToken,
-		"other HMAC alg":     hs512,
+		"wrong secret":       chatToken(t, "a-completely-different-secret-value-123", hs, nil),
+		"alg none":           chatToken(t, testSecret, jwt.SigningMethodNone, nil),
+		"other HMAC alg":     chatToken(t, testSecret, jwt.SigningMethodHS512, nil),
 		"tampered signature": valid[:len(valid)-2] + "xx",
-		"expired":            sessionToken(t, testSecret, func(c *Claims) { c.ExpiresAt = jwt.NewNumericDate(time.Now().Add(-time.Hour)) }),
-		"no expiry":          sessionToken(t, testSecret, func(c *Claims) { c.ExpiresAt = nil }),
-		"wrong issuer":       sessionToken(t, testSecret, func(c *Claims) { c.Issuer = "someone-else" }),
-		"chat audience":      sessionToken(t, testSecret, func(c *Claims) { c.Audience = jwt.ClaimStrings{AudienceChat} }),
-		"payout audience":    sessionToken(t, testSecret, func(c *Claims) { c.Audience = jwt.ClaimStrings{AudiencePayout} }),
-		"legacy no audience": sessionToken(t, testSecret, func(c *Claims) { c.Audience = nil; c.Issuer = "" }),
-		"empty user id":      sessionToken(t, testSecret, func(c *Claims) { c.UserID = "" }),
-		"issued in future":   sessionToken(t, testSecret, func(c *Claims) { c.IssuedAt = jwt.NewNumericDate(time.Now().Add(time.Hour)) }),
+		"expired":            chatToken(t, testSecret, hs, func(c *testClaims) { c.ExpiresAt = jwt.NewNumericDate(time.Now().Add(-time.Hour)) }),
+		"no expiry":          chatToken(t, testSecret, hs, func(c *testClaims) { c.ExpiresAt = nil }),
+		"wrong issuer":       chatToken(t, testSecret, hs, func(c *testClaims) { c.Issuer = "someone-else" }),
+		"payout audience":    chatToken(t, testSecret, hs, func(c *testClaims) { c.Audience = jwt.ClaimStrings{AudiencePayout} }),
+		"no audience":        chatToken(t, testSecret, hs, func(c *testClaims) { c.Audience = nil; c.Issuer = "" }),
+		"issued in future":   chatToken(t, testSecret, hs, func(c *testClaims) { c.IssuedAt = jwt.NewNumericDate(time.Now().Add(time.Hour)) }),
 	}
 	for name, tok := range cases {
-		if got := protectedStatus(t, tok); got != 401 {
-			t.Errorf("%s: got %d, want 401", name, got)
+		if err := ParseToken(testSecret, tok, AudienceChat, &testClaims{}); err == nil {
+			t.Errorf("%s: accepted", name)
 		}
 	}
 }
@@ -97,8 +84,8 @@ func TestPayoutTokenRequiresPayoutAudienceAndSameUser(t *testing.T) {
 	if got := run(sign(AudiencePayout, "user-1")); got != 200 {
 		t.Fatalf("valid payout token: got %d", got)
 	}
-	if got := run(sign(AudienceSession, "user-1")); got != 403 {
-		t.Errorf("session-audience token used as payout token: got %d, want 403", got)
+	if got := run(sign(AudienceChat, "user-1")); got != 403 {
+		t.Errorf("chat-audience token used as payout token: got %d, want 403", got)
 	}
 	if got := run(sign(AudiencePayout, "user-2")); got != 403 {
 		t.Errorf("another user's payout token: got %d, want 403", got)
@@ -106,10 +93,10 @@ func TestPayoutTokenRequiresPayoutAudienceAndSameUser(t *testing.T) {
 }
 
 func TestSigningWithoutSecretFails(t *testing.T) {
-	if _, err := SignToken("", &Claims{}); err == nil {
+	if _, err := SignToken("", &testClaims{}); err == nil {
 		t.Fatal("signing with an empty secret must fail")
 	}
-	if err := ParseToken("", "x", AudienceSession, &Claims{}); err == nil {
+	if err := ParseToken("", "x", AudienceChat, &testClaims{}); err == nil {
 		t.Fatal("parsing with an empty secret must fail")
 	}
 }

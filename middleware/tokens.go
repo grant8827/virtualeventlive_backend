@@ -7,15 +7,15 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-// Every token the API signs carries this issuer and one audience naming what
+// Every JWT the API signs carries this issuer and one audience naming what
 // it's for. Validation pins the algorithm (HS256 only, so "none" or an
 // RS256/HS256 confusion is rejected), the issuer, the audience, and requires
-// an expiry — so a chat or payout token can never pass as a sign-in session.
+// an expiry — so a chat token can't be used as a payout token or vice versa.
+// Sign-in itself no longer uses JWTs: it's a server-side session (session.go).
 const (
-	TokenIssuer     = "virtualeventplus"
-	AudienceSession = "session"
-	AudienceChat    = "chat"
-	AudiencePayout  = "payout"
+	TokenIssuer    = "virtualeventplus"
+	AudienceChat   = "chat"
+	AudiencePayout = "payout"
 )
 
 // tokenLeeway tolerates small clock differences between servers.

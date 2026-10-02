@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 
+	"vertualeventlive/backend/middleware"
 	"vertualeventlive/backend/services"
 )
 
@@ -436,6 +437,10 @@ func (h *SuperuserHandler) UpdateUser(c *fiber.Ctx) error {
 		req.Status, req.Role, passwordHash, targetID,
 	); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to update user"})
+	}
+	// Suspension, role change or password reset ends the user's sessions.
+	if (req.Status != nil && *req.Status != "active") || req.Role != nil || passwordHash != nil {
+		_, _ = middleware.RevokeUserSessions(context.Background(), h.DB, targetID, "account_changed_by_superuser", "")
 	}
 
 	// Approving a newly registered host: let them know they can sign in.
