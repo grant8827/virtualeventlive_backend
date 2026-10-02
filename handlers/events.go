@@ -161,9 +161,6 @@ func (h *EventHandler) Checkout(c *fiber.Ctx) error {
 
 	params := &stripe.CheckoutSessionParams{
 		Mode: stripe.String(string(stripe.CheckoutSessionModePayment)),
-		// Card only: card payments are confirmed immediately, so a completed
-		// checkout is always a paid one.
-		PaymentMethodTypes: []*string{stripe.String("card")},
 		LineItems: []*stripe.CheckoutSessionLineItemParams{
 			{
 				PriceData: &stripe.CheckoutSessionLineItemPriceDataParams{
@@ -185,6 +182,11 @@ func (h *EventHandler) Checkout(c *fiber.Ctx) error {
 			"host_id":  hostID,
 		},
 	}
+	// The platform uses standard Checkout. Stripe enables Managed Payments by
+	// default on this account, but that product requires tax codes for every
+	// inline product. stripe-go v82 predates this typed field, so pass Stripe's
+	// documented opt-out as an extra parameter.
+	params.AddExtra("managed_payments[enabled]", "false")
 
 	s, err := session.New(params)
 	if err != nil {

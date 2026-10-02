@@ -375,8 +375,7 @@ func (h *TicketHandler) GuestPurchase(c *fiber.Ctx) error {
 	stripe.Key = h.Cfg.StripeSecretKey
 
 	params := &stripe.CheckoutSessionParams{
-		Mode:               stripe.String(string(stripe.CheckoutSessionModePayment)),
-		PaymentMethodTypes: []*string{stripe.String("card")},
+		Mode: stripe.String(string(stripe.CheckoutSessionModePayment)),
 		LineItems: []*stripe.CheckoutSessionLineItemParams{
 			{
 				PriceData: &stripe.CheckoutSessionLineItemPriceDataParams{
@@ -398,6 +397,7 @@ func (h *TicketHandler) GuestPurchase(c *fiber.Ctx) error {
 			"guest_email": req.Email,
 		},
 	}
+	params.AddExtra("managed_payments[enabled]", "false")
 	params.PaymentIntentData = &stripe.CheckoutSessionPaymentIntentDataParams{
 		ApplicationFeeAmount: stripe.Int64(int64(split.PlatformFee * 100)),
 		TransferData: &stripe.CheckoutSessionPaymentIntentDataTransferDataParams{
@@ -479,8 +479,7 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 	stripe.Key = h.Cfg.StripeSecretKey
 
 	params := &stripe.CheckoutSessionParams{
-		Mode:               stripe.String(string(stripe.CheckoutSessionModePayment)),
-		PaymentMethodTypes: []*string{stripe.String("card")},
+		Mode: stripe.String(string(stripe.CheckoutSessionModePayment)),
 		LineItems: []*stripe.CheckoutSessionLineItemParams{
 			{
 				PriceData: &stripe.CheckoutSessionLineItemPriceDataParams{
@@ -502,6 +501,7 @@ func (h *TicketHandler) Purchase(c *fiber.Ctx) error {
 			"buyer_id": buyerID,
 		},
 	}
+	params.AddExtra("managed_payments[enabled]", "false")
 	params.PaymentIntentData = &stripe.CheckoutSessionPaymentIntentDataParams{
 		ApplicationFeeAmount: stripe.Int64(int64(split.PlatformFee * 100)),
 		TransferData: &stripe.CheckoutSessionPaymentIntentDataTransferDataParams{
