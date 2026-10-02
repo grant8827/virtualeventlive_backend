@@ -149,6 +149,7 @@ func (h *SuperuserHandler) issueInvitation(c *fiber.Ctx, email, actorID string, 
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to create invitation"})
 	}
 	inv.Token = token
+	recordSecurityEvent(ctx, h.DB, c, "invitation_issued", actorID, "", map[string]any{"invitation_id": id})
 
 	resp := fiber.Map{"invitation": inv, "email_sent": false}
 	if h.Email != nil && h.Email.Enabled() {
@@ -168,6 +169,7 @@ func (h *SuperuserHandler) DeleteInvitation(c *fiber.Ctx) error {
 	if err != nil || tag.RowsAffected() == 0 {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "invitation not found or already used"})
 	}
+	recordSecurityEvent(context.Background(), h.DB, c, "invitation_revoked", actorOf(c), "", map[string]any{"invitation_id": c.Params("id")})
 	return c.JSON(fiber.Map{"ok": true})
 }
 

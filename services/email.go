@@ -216,6 +216,38 @@ func (e *EmailService) SendPasswordReset(toEmail, resetURL string) error {
 	return e.send(toEmail, "Reset your Virtual Event Plus password", html)
 }
 
+// SendEmailVerification sends a one-time link that proves the recipient owns
+// this address — for a new account, or a change to a new address.
+func (e *EmailService) SendEmailVerification(toEmail, verifyURL string, isChange bool) error {
+	if !e.Enabled() {
+		fmt.Printf("email: not configured (SMTP_HOST / RESEND_API_KEY) — skipping verification email to %s\n", toEmail)
+		return nil
+	}
+	heading, intro, subject := "Confirm your email", "Confirm this address to start using your Virtual Event Plus account.", "Confirm your Virtual Event Plus email"
+	if isChange {
+		heading = "Confirm your new email"
+		intro = "You asked to change the email on your Virtual Event Plus account to this address. It only changes once you confirm."
+		subject = "Confirm your new Virtual Event Plus email"
+	}
+	body := fmt.Sprintf(`
+<!DOCTYPE html>
+<html>
+<body style="font-family:sans-serif;background:#080d22;color:#fff;padding:40px 20px;margin:0">
+  <div style="max-width:520px;margin:0 auto">
+    <h1 style="font-size:22px;margin-bottom:4px">%s</h1>
+    <p style="color:#b3bcd6;font-size:14px;line-height:1.6">%s</p>
+    <a href="%s" style="display:inline-block;background:#0067f9;color:#fff;padding:12px 28px;border-radius:9999px;font-size:14px;font-weight:600;text-decoration:none;margin:20px 0">
+      Confirm email
+    </a>
+    <p style="color:#8590b0;font-size:12px;line-height:1.6">
+      This link expires in 24 hours and works once. If you didn't expect this email, you can ignore it.
+    </p>
+  </div>
+</body>
+</html>`, html.EscapeString(heading), html.EscapeString(intro), html.EscapeString(verifyURL))
+	return e.send(toEmail, subject, body)
+}
+
 // SendAccountApproved tells a newly registered host they can sign in.
 func (e *EmailService) SendAccountApproved(toEmail string) error {
 	if !e.Enabled() {

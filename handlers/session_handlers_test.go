@@ -21,7 +21,7 @@ func createLoginUser(t *testing.T, password string) (id, email string) {
 	email = "login-" + uniq() + "@phase1.test"
 	hash, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
 	if err := db.QueryRow(context.Background(),
-		`INSERT INTO users (email, password_hash, role, status) VALUES ($1, $2, 'host', 'active') RETURNING id`,
+		`INSERT INTO users (email, password_hash, role, status, email_verified_at) VALUES ($1, $2, 'host', 'active', NOW()) RETURNING id`,
 		email, string(hash),
 	).Scan(&id); err != nil {
 		t.Fatal(err)

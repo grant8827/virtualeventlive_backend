@@ -69,6 +69,8 @@ func (h *AuthHandler) ForgotPassword(c *fiber.Ctx) error {
 		return respond()
 	}
 
+	recordSecurityEvent(ctx, h.DB, c, "password_reset_requested", "", userID, nil)
+
 	// Sent in the background so the response time doesn't reveal whether
 	// the account exists.
 	resetURL := h.Cfg.FrontendURL + "/reset-password?token=" + token
@@ -147,6 +149,7 @@ func (h *AuthHandler) ResetPassword(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to reset password"})
 	}
 	// Whoever might have been signed in with the old password is signed out.
-	_, _ = middleware.RevokeUserSessions(ctx, h.DB, userID, "password_reset", "")
+	n, _ := middleware.RevokeUserSessions(ctx, h.DB, userID, "password_reset", "")
+	recordSecurityEvent(ctx, h.DB, c, "password_reset_completed", userID, userID, map[string]any{"sessions_revoked": n})
 	return c.JSON(fiber.Map{"message": "Your password has been reset. You can sign in now."})
 }

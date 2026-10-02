@@ -442,6 +442,17 @@ func (h *SuperuserHandler) UpdateUser(c *fiber.Ctx) error {
 	if (req.Status != nil && *req.Status != "active") || req.Role != nil || passwordHash != nil {
 		_, _ = middleware.RevokeUserSessions(context.Background(), h.DB, targetID, "account_changed_by_superuser", "")
 	}
+	changed := map[string]any{"previous_status": currentStatus, "previous_role": currentRole}
+	if req.Status != nil {
+		changed["status"] = *req.Status
+	}
+	if req.Role != nil {
+		changed["role"] = *req.Role
+	}
+	if passwordHash != nil {
+		changed["password_reset"] = true
+	}
+	recordSecurityEvent(context.Background(), h.DB, c, "superuser_user_updated", actorID, targetID, changed)
 
 	// Approving a newly registered host: let them know they can sign in.
 	if currentStatus == "pending" && req.Status != nil && *req.Status == "active" && h.Email != nil {
@@ -488,6 +499,7 @@ func (h *SuperuserHandler) RejectUser(c *fiber.Ctx) error {
 	if err := tx.Commit(ctx); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to reject user"})
 	}
+	recordSecurityEvent(ctx, h.DB, c, "superuser_user_rejected", actorOf(c), "", map[string]any{"user_id": c.Params("id")})
 	return c.JSON(fiber.Map{"ok": true})
 }
 
@@ -618,6 +630,7 @@ func (h *SuperuserHandler) ActivateEvent(c *fiber.Ctx) error {
 	if err := activateVenuePaidEvent(ctx, h.DB, h.IVS, eventID); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to activate event"})
 	}
+	recordSecurityEvent(ctx, h.DB, c, "superuser_event_approved", actorOf(c), "", map[string]any{"event_id": eventID})
 	if _, err := h.DB.Exec(ctx, `UPDATE events SET venue_bypassed = true WHERE id = $1`, eventID); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to activate event"})
 	}
@@ -642,6 +655,7 @@ func (h *SuperuserHandler) UpdateEvent(c *fiber.Ctx) error {
 	if err != nil || tag.RowsAffected() == 0 {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "only paid, upcoming events can be disabled or enabled"})
 	}
+	recordSecurityEvent(context.Background(), h.DB, c, "superuser_event_updated", actorOf(c), "", map[string]any{"event_id": c.Params("id"), "is_active": *req.IsActive})
 	return h.respondEvent(c, c.Params("id"))
 }
 
@@ -673,6 +687,7 @@ func (h *SuperuserHandler) CancelEvent(c *fiber.Ctx) error {
 	if err := tx.Commit(ctx); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to cancel event"})
 	}
+	recordSecurityEvent(ctx, h.DB, c, "superuser_event_cancelled", actorOf(c), "", map[string]any{"event_id": eventID})
 	return h.respondEvent(c, eventID)
 }
 

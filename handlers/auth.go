@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -99,8 +100,9 @@ func (h *AuthHandler) Register(c *fiber.Ctx) error {
 	err = tx.QueryRow(ctx,
 		`INSERT INTO users (
 			email, password_hash, role, status, full_name, phone,
-			address_line1, address_line2, city, state, postal_code, country, organization_name
-		) VALUES ($1, $2, 'host', 'pending', $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			address_line1, address_line2, city, state, postal_code, country, organization_name,
+			email_verified_at
+		) VALUES ($1, $2, 'host', 'pending', $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
 		RETURNING id`,
 		email, string(hash), req.FullName, req.Phone,
 		req.AddressLine1, req.AddressLine2, req.City, req.State, req.PostalCode, req.Country, req.OrganizationName,
@@ -138,27 +140,30 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 
 	failKey := loginFailureKey(req.Email)
 	if h.Limiter.Count(ctx, failKey, loginFailureWindow) >= loginMaxFailures {
+		recordSecurityEvent(ctx, h.DB, c, "login_locked", "", "", map[string]any{"email_hash": middleware.HashKey(req.Email)})
 		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
 			"error": "Too many failed sign-in attempts. Try again in 15 minutes, or reset your password.",
 		})
 	}
-	fail := func() error {
+	fail := func(targetID string) error {
 		h.Limiter.Hit(ctx, failKey, loginFailureWindow)
+		recordSecurityEvent(ctx, h.DB, c, "login_failed", "", targetID, map[string]any{"email_hash": middleware.HashKey(req.Email)})
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid credentials"})
 	}
 
 	var userID, email, passwordHash, role, status string
+	var verified bool
 	err := h.DB.QueryRow(ctx,
-		`SELECT id, email, password_hash, role, status FROM users WHERE email = $1`,
+		`SELECT id, email, password_hash, role, status, email_verified_at IS NOT NULL FROM users WHERE email = $1`,
 		req.Email,
-	).Scan(&userID, &email, &passwordHash, &role, &status)
+	).Scan(&userID, &email, &passwordHash, &role, &status, &verified)
 	if err != nil {
 		_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(req.Password))
-		return fail()
+		return fail("")
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password)); err != nil {
-		return fail()
+		return fail(userID)
 	}
 	h.Limiter.Reset(ctx, failKey, loginFailureWindow)
 	if status == "pending" {
@@ -166,6 +171,17 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 	}
 	if status != "active" {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "this account has been suspended"})
+	}
+	// Staff/admins added by a host must prove the address before first use.
+	// A fresh link is sent (rate-limited) each time they try.
+	if !verified {
+		if n, _ := h.Limiter.Hit(ctx, "login-verify-resend:"+userID, 5*time.Minute); n <= 1 {
+			_ = h.verifier().start(ctx, userID, email, "verify")
+		}
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": "Please confirm your email first — we've sent a verification link to your inbox.",
+			"code":  "email_unverified",
+		})
 	}
 
 	// A new server-side session; the browser gets its ID only as an HttpOnly
@@ -175,6 +191,7 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to sign in"})
 	}
 	middleware.SetSessionCookie(c, h.Session, token, expires)
+	recordSecurityEvent(ctx, h.DB, c, "login_success", userID, userID, nil)
 
 	return c.JSON(fiber.Map{
 		"id":    userID,
@@ -188,6 +205,7 @@ func (h *AuthHandler) Logout(c *fiber.Ctx) error {
 	if token := c.Cookies(h.Session.CookieName()); token != "" {
 		if s, err := middleware.LookupSession(context.Background(), h.DB, token); err == nil {
 			_ = middleware.RevokeSession(context.Background(), h.DB, s.SessionID, "logout")
+			recordSecurityEvent(context.Background(), h.DB, c, "logout", s.UserID, s.UserID, nil)
 		}
 	}
 	middleware.ClearSessionCookie(c, h.Session)
@@ -198,9 +216,11 @@ func (h *AuthHandler) Logout(c *fiber.Ctx) error {
 // this one.
 func (h *AuthHandler) LogoutEverywhere(c *fiber.Ctx) error {
 	userID := c.Locals("user_id").(string)
-	if _, err := middleware.RevokeUserSessions(context.Background(), h.DB, userID, "logout_everywhere", ""); err != nil {
+	n, err := middleware.RevokeUserSessions(context.Background(), h.DB, userID, "logout_everywhere", "")
+	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to sign out"})
 	}
+	recordSecurityEvent(context.Background(), h.DB, c, "logout_everywhere", userID, userID, map[string]any{"sessions_revoked": n})
 	middleware.ClearSessionCookie(c, h.Session)
 	return c.JSON(fiber.Map{"message": "signed out on all devices"})
 }
@@ -214,11 +234,15 @@ func (h *AuthHandler) Me(c *fiber.Ctx) error {
 		email, role, status                                                  string
 		fullName, phone, addressLine1, addressLine2, city, state, postalCode *string
 		country, organizationName                                            *string
+		emailVerified                                                        bool
+		pendingEmail                                                         *string
 	)
 	err := h.DB.QueryRow(context.Background(),
-		`SELECT email, role, status, full_name, phone, address_line1, address_line2, city, state, postal_code, country, organization_name
+		`SELECT email, role, status, full_name, phone, address_line1, address_line2, city, state, postal_code, country, organization_name,
+		        email_verified_at IS NOT NULL, pending_email
 		 FROM users WHERE id = $1`, userID,
-	).Scan(&email, &role, &status, &fullName, &phone, &addressLine1, &addressLine2, &city, &state, &postalCode, &country, &organizationName)
+	).Scan(&email, &role, &status, &fullName, &phone, &addressLine1, &addressLine2, &city, &state, &postalCode, &country, &organizationName,
+		&emailVerified, &pendingEmail)
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "user not found"})
 	}
@@ -239,6 +263,8 @@ func (h *AuthHandler) Me(c *fiber.Ctx) error {
 		"postal_code":       postalCode,
 		"country":           country,
 		"organization_name": organizationName,
+		"email_verified":    emailVerified,
+		"pending_email":     pendingEmail,
 	})
 }
 
@@ -267,18 +293,38 @@ func (h *AuthHandler) UpdateProfile(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "email, full name, phone, and address are required"})
 	}
 
-	_, err := h.DB.Exec(context.Background(),
-		`UPDATE users SET email = $1, full_name = $2, phone = $3, address_line1 = $4, address_line2 = $5,
-		 city = $6, state = $7, postal_code = $8, country = $9, organization_name = $10, updated_at = NOW()
-		 WHERE id = $11`,
-		req.Email, req.FullName, req.Phone, req.AddressLine1, req.AddressLine2,
-		req.City, req.State, req.PostalCode, req.Country, req.OrganizationName, userID,
-	)
-	if err != nil {
-		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "email already in use"})
+	ctx := context.Background()
+	req.Email = strings.TrimSpace(req.Email)
+	if !isValidEmail(req.Email) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "enter a valid email address"})
+	}
+	var currentEmail string
+	if err := h.DB.QueryRow(ctx, `SELECT email FROM users WHERE id = $1`, userID).Scan(&currentEmail); err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "user not found"})
 	}
 
-	return c.JSON(fiber.Map{"message": "profile updated"})
+	// The sign-in email only changes once the new address is confirmed.
+	if _, err := h.DB.Exec(ctx,
+		`UPDATE users SET full_name = $1, phone = $2, address_line1 = $3, address_line2 = $4,
+		 city = $5, state = $6, postal_code = $7, country = $8, organization_name = $9, updated_at = NOW()
+		 WHERE id = $10`,
+		req.FullName, req.Phone, req.AddressLine1, req.AddressLine2,
+		req.City, req.State, req.PostalCode, req.Country, req.OrganizationName, userID,
+	); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to update profile"})
+	}
+	if strings.EqualFold(req.Email, currentEmail) {
+		return c.JSON(fiber.Map{"message": "profile updated"})
+	}
+	pending, err := requestEmailChange(ctx, h.verifier(), userID, req.Email)
+	if err != nil {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": err.Error()})
+	}
+	recordSecurityEvent(ctx, h.DB, c, "email_change_requested", userID, userID, nil)
+	return c.JSON(fiber.Map{
+		"message":       "Profile updated. We sent a link to " + pending + " — your email changes once you confirm it.",
+		"pending_email": pending,
+	})
 }
 
 type changePasswordRequest struct {
@@ -322,7 +368,8 @@ func (h *AuthHandler) ChangePassword(c *fiber.Ctx) error {
 	}
 	// Sign out every other device; this one stays signed in.
 	currentSession, _ := c.Locals("session_id").(string)
-	_, _ = middleware.RevokeUserSessions(context.Background(), h.DB, userID, "password_changed", currentSession)
+	n, _ := middleware.RevokeUserSessions(context.Background(), h.DB, userID, "password_changed", currentSession)
+	recordSecurityEvent(context.Background(), h.DB, c, "password_changed", userID, userID, map[string]any{"other_sessions_revoked": n})
 
 	return c.JSON(fiber.Map{"message": "password updated"})
 }

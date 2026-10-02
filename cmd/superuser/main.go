@@ -81,6 +81,7 @@ func main() {
 		}
 		if _, err := db.Exec(ctx,
 			`UPDATE users SET role = 'superuser', status = 'active',
+			        email_verified_at = COALESCE(email_verified_at, NOW()),
 			        password_hash = COALESCE($1, password_hash), updated_at = NOW()
 			 WHERE id = $2`, hash, id,
 		); err != nil {
@@ -92,7 +93,7 @@ func main() {
 
 	hash := hashPassword(readPassword())
 	if _, err := db.Exec(ctx,
-		`INSERT INTO users (email, password_hash, role, full_name) VALUES ($1, $2, 'superuser', $3)`,
+		`INSERT INTO users (email, password_hash, role, full_name, email_verified_at) VALUES ($1, $2, 'superuser', $3, NOW())`,
 		*email, hash, strings.TrimSpace(*name),
 	); err != nil {
 		log.Fatalf("create: %v", err)

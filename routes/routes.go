@@ -103,6 +103,9 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	v1.Post("/auth/login", perIP("login", 30, 15*time.Minute), authH.Login)
 	v1.Post("/auth/logout", authH.Logout)
 	v1.Post("/auth/logout-everywhere", requireSession, authH.LogoutEverywhere)
+	// Email verification (staff/admin accounts and email changes).
+	v1.Post("/auth/verify-email", perIP("verify-email", 30, 15*time.Minute), authH.VerifyEmail)
+	v1.Post("/auth/resend-verification", perIP("resend-verification", 10, time.Hour), authH.ResendVerification)
 	v1.Get("/auth/me", requireSession, authH.Me)
 	v1.Put("/auth/profile", requireSession, authH.UpdateProfile)
 	v1.Post("/auth/change-password", requireSession, authH.ChangePassword)
@@ -196,7 +199,7 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	v1.Post("/connect/payout", requireSession, hostAdmin, payoutAuth, payoutH.Payout)
 
 	// Team — the Add User page: staff/admin logins on this host account
-	teamH := &handlers.TeamHandler{DB: db}
+	teamH := &handlers.TeamHandler{DB: db, Email: emailSvc, Cfg: cfg}
 	v1.Get("/team", requireSession, hostAdmin, teamH.List)
 	v1.Post("/team", requireSession, hostAdmin, teamH.Create)
 	v1.Patch("/team/:id", requireSession, hostAdmin, teamH.Update)
@@ -207,6 +210,7 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	superH := &handlers.SuperuserHandler{DB: db, IVS: ivsSvc, Email: emailSvc}
 	su := v1.Group("/superuser", requireSession, middleware.RequireSuperuser(db))
 	su.Get("/overview", superH.Overview)
+	su.Get("/security-events", superH.ListSecurityEvents)
 	su.Get("/users", superH.ListUsers)
 	su.Patch("/users/:id", superH.UpdateUser)
 	su.Delete("/users/:id", superH.RejectUser)
