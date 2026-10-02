@@ -81,6 +81,17 @@ type Config struct {
 	PaypalPartnerMerchantID    string
 	PaypalPartnerAttributionID string
 	PaypalWebhookID            string
+
+	// Orders and accounting (Phase 2).
+	// PlatformFeeBPS is the commission on ticket sales in basis points
+	// (1000 = 10%). Each order stores the rule it was sold under.
+	PlatformFeeBPS int
+	// MaxTicketsPerBuyer caps paid tickets per buyer email per event
+	// (issued plus reserved). Free tickets are always one per email.
+	MaxTicketsPerBuyer int
+	// ReconcileInterval runs provider reconciliation in the background
+	// (e.g. "6h"); "0" turns it off. One instance runs it at a time.
+	ReconcileInterval string
 }
 
 func Load() *Config {
@@ -134,6 +145,10 @@ func Load() *Config {
 		PaypalPartnerMerchantID:    getEnv("PAYPAL_PARTNER_MERCHANT_ID", ""),
 		PaypalPartnerAttributionID: getEnv("PAYPAL_PARTNER_ATTRIBUTION_ID", ""),
 		PaypalWebhookID:            getEnv("PAYPAL_WEBHOOK_ID", ""),
+
+		PlatformFeeBPS:     getInt("PLATFORM_FEE_BPS", 1000),
+		MaxTicketsPerBuyer: getInt("MAX_TICKETS_PER_BUYER", 10),
+		ReconcileInterval:  getEnv("RECONCILE_INTERVAL", "6h"),
 	}
 }
 
@@ -165,6 +180,14 @@ func getFloat(key string, fallback float64) float64 {
 		return fallback
 	}
 	return f
+}
+
+func getInt(key string, fallback int) int {
+	v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(key)))
+	if err != nil {
+		return fallback
+	}
+	return v
 }
 
 func (c *Config) MissingS3EnvKeys() []string {

@@ -136,3 +136,33 @@ func TestWiPayVenueFeeRefusedInProduction(t *testing.T) {
 		t.Fatalf("development may opt in explicitly: %v", err)
 	}
 }
+
+func TestPaymentLimitsValidated(t *testing.T) {
+	base := func() *Config {
+		return &Config{AppEnv: "production", JWTSecret: strongSecret, PlatformFeeBPS: 1000, ReconcileInterval: "6h"}
+	}
+	if err := base().Validate(); err != nil {
+		t.Fatalf("defaults rejected: %v", err)
+	}
+	for name, mutate := range map[string]func(*Config){
+		"negative fee":       func(c *Config) { c.PlatformFeeBPS = -1 },
+		"fee over 50%":       func(c *Config) { c.PlatformFeeBPS = 5001 },
+		"negative per-buyer": func(c *Config) { c.MaxTicketsPerBuyer = -3 },
+		"bad interval":       func(c *Config) { c.ReconcileInterval = "soon" },
+		"interval too short": func(c *Config) { c.ReconcileInterval = "30s" },
+	} {
+		c := base()
+		mutate(c)
+		if err := c.Validate(); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	off := base()
+	off.ReconcileInterval = "0"
+	if d, err := off.ReconcileEvery(); err != nil || d != 0 {
+		t.Errorf("RECONCILE_INTERVAL=0: %v %v", d, err)
+	}
+	if base().TicketsPerBuyer() != 10 {
+		t.Error("per-buyer default is not 10")
+	}
+}

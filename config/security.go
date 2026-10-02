@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 // minProductionSecretLen is the shortest JWT secret accepted outside
@@ -48,6 +49,27 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// TicketsPerBuyer is the per-buyer, per-event cap on paid tickets.
+func (c *Config) TicketsPerBuyer() int {
+	if c.MaxTicketsPerBuyer <= 0 {
+		return 10
+	}
+	return c.MaxTicketsPerBuyer
+}
+
+// ReconcileEvery is the background reconciliation interval; 0 means off.
+func (c *Config) ReconcileEvery() (time.Duration, error) {
+	v := strings.TrimSpace(c.ReconcileInterval)
+	if v == "" || v == "0" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 5*time.Minute {
+		return 0, fmt.Errorf("RECONCILE_INTERVAL must be a duration of at least 5m, or 0 (got %q)", v)
+	}
+	return d, nil
+}
+
 // validatePayments keeps incomplete or unverifiable payment integrations
 // from running by accident.
 func (c *Config) validatePayments() error {
@@ -72,6 +94,15 @@ func (c *Config) validatePayments() error {
 		if c.PaypalEnvironment != "live" && c.PaypalEnvironment != "sandbox" {
 			return errors.New("PAYPAL_ENVIRONMENT must be set to live or sandbox when PAYPAL_ENABLED=true")
 		}
+	}
+	if c.PlatformFeeBPS < 0 || c.PlatformFeeBPS > 5000 {
+		return fmt.Errorf("PLATFORM_FEE_BPS must be between 0 and 5000 (got %d)", c.PlatformFeeBPS)
+	}
+	if c.MaxTicketsPerBuyer < 0 {
+		return fmt.Errorf("MAX_TICKETS_PER_BUYER must be at least 1 (got %d)", c.MaxTicketsPerBuyer)
+	}
+	if _, err := c.ReconcileEvery(); err != nil {
+		return err
 	}
 	if c.WipayVenueFeeEnabled && !c.IsDevelopment() {
 		return errors.New("WIPAY_VENUE_FEE_ENABLED is not allowed in production: WiPay payments can't be verified server-side yet")
