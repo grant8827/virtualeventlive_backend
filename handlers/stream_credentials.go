@@ -11,8 +11,9 @@ import (
 )
 
 type StreamCredentialsHandler struct {
-	DB  *pgxpool.Pool
-	IVS *services.IVSService
+	DB       *pgxpool.Pool
+	IVS      *services.IVSService
+	Playback *PlaybackAccess
 }
 
 func (h *StreamCredentialsHandler) Get(c *fiber.Ctx) error {
@@ -27,16 +28,17 @@ func (h *StreamCredentialsHandler) Get(c *fiber.Ctx) error {
 		streamIngestURL *string
 		streamKeyValue  *string
 		playbackURL     *string
+		channelARN      *string
 		venuePaid       bool
 		title           string
 		endsAt          time.Time
 	)
 
 	err := h.DB.QueryRow(context.Background(),
-		`SELECT title, stream_ingest_url, stream_key_value, aws_playback_url, venue_paid, ends_at
+		`SELECT title, stream_ingest_url, stream_key_value, aws_playback_url, aws_channel_arn, venue_paid, ends_at
 		 FROM events WHERE id = $1 AND host_id = $2`,
 		eventID, hostID,
-	).Scan(&title, &streamIngestURL, &streamKeyValue, &playbackURL, &venuePaid, &endsAt)
+	).Scan(&title, &streamIngestURL, &streamKeyValue, &playbackURL, &channelARN, &venuePaid, &endsAt)
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "event not found"})
 	}
@@ -52,12 +54,17 @@ func (h *StreamCredentialsHandler) Get(c *fiber.Ctx) error {
 		})
 	}
 
+	// The host's own preview gets a signed URL like any viewer.
+	var hostPlayback *string
+	if u, err := h.Playback.URL(playbackURL, channelARN); err == nil && u != "" {
+		hostPlayback = &u
+	}
 	return c.JSON(fiber.Map{
 		"event_id":          eventID,
 		"title":             title,
 		"stream_ingest_url": streamIngestURL,
 		"stream_key_value":  streamKeyValue,
-		"playback_url":      playbackURL,
+		"playback_url":      hostPlayback,
 		"ivs_ready":         streamIngestURL != nil && streamKeyValue != nil,
 	})
 }

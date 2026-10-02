@@ -752,7 +752,9 @@ func (h *EventHandler) GetByID(c *fiber.Ctx) error {
 		"venue_address":    venueAddress,
 		"is_active":        isActive,
 		"expired":          expired,
-		"aws_playback_url": playbackURL,
-		"created_at":       createdAt,
+		// Public: whether the event has a stream channel, never its playback
+		// URL. Playback is only issued by /tickets/enter after a ticket check.
+		"has_stream": playbackURL != nil && *playbackURL != "",
+		"created_at": createdAt,
 	})
 }

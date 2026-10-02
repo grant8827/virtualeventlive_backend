@@ -1,6 +1,8 @@
 package routes
 
 import (
+	"log"
+
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/websocket/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -23,6 +25,18 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 		SMTPPassword: cfg.SMTPPassword,
 	}
 	ivsSvc := services.NewIVSService(cfg.AWSAccessKeyID, cfg.AWSSecretAccessKey, cfg.AWSRegion)
+	ivsSvc.AuthorizedChannels = cfg.IVSPlaybackAuthRequired
+
+	// IVS private playback: playback URLs are only issued after a server-side
+	// ticket check, signed with a short-lived token when a key is configured.
+	playback := &handlers.PlaybackAccess{Required: cfg.IVSPlaybackAuthRequired}
+	if cfg.IVSPlaybackPrivateKey != "" {
+		signer, err := services.NewPlaybackSigner(cfg.IVSPlaybackPrivateKey, cfg.IVSPlaybackAllowOrigin, services.DefaultPlaybackTokenTTL)
+		if err != nil {
+			log.Fatalf("IVS playback signing: %v", err)
+		}
+		playback.Signer = signer
+	}
 	s3Storage := services.NewS3Storage(
 		cfg.AWSAccessKeyID,
 		cfg.AWSSecretAccessKey,
@@ -124,7 +138,7 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	v1.Delete("/advertisements/:id", middleware.Protected(cfg.JWTSecret), hostStaff, adH.Delete)
 
 	// Stream credentials — host only, returns IVS ingest URL + stream key
-	credH := &handlers.StreamCredentialsHandler{DB: db, IVS: ivsSvc}
+	credH := &handlers.StreamCredentialsHandler{DB: db, IVS: ivsSvc, Playback: playback}
 	v1.Get("/events/:id/stream-credentials", middleware.Protected(cfg.JWTSecret), hostStaff, eventAccess, credH.Get)
 	v1.Post("/events/:id/reprovision-stream", middleware.Protected(cfg.JWTSecret), hostStaff, eventAccess, credH.Reprovision)
 	// Live viewer count for the Go Live page
@@ -185,7 +199,8 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 	// Tickets
 	ticketH := &handlers.TicketHandler{
 		DB: db, Cfg: cfg, Email: emailSvc,
-		PayPal: newPayPalService(cfg),
+		PayPal:   newPayPalService(cfg),
+		Playback: playback,
 	}
 	app.Post("/api/v1/webhooks/paypal", ticketH.PayPalWebhook)
 	// Find my tickets: emails the tickets to the address (never returns them).
@@ -204,7 +219,7 @@ func Register(app *fiber.App, db *pgxpool.Pool, rdb *redis.Client, cfg *config.C
 
 	// Viewer stream — Redis session locking
 	guard := &services.SessionGuard{RDB: rdb}
-	streamH := &handlers.StreamHandler{DB: db, Guard: guard}
+	streamH := &handlers.StreamHandler{DB: db, Guard: guard, Playback: playback}
 	v1.Post("/stream/watch", middleware.Protected(cfg.JWTSecret), streamH.Watch)
 	v1.Post("/stream/heartbeat", middleware.Protected(cfg.JWTSecret), streamH.Heartbeat)
 	v1.Post("/stream/release", middleware.Protected(cfg.JWTSecret), streamH.Release)

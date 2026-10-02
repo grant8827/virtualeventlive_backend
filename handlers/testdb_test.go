@@ -115,8 +115,8 @@ func createTestEvent(t *testing.T, db *pgxpool.Pool, hostID string, e testEvent)
 	}
 	var id string
 	if err := db.QueryRow(context.Background(),
-		`INSERT INTO events (host_id, title, start_time, ends_at, ticket_price, venue_paid, is_active, cancelled_at, max_tickets)
-		 VALUES ($1, 'Phase 0 test event', $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+		`INSERT INTO events (host_id, title, description, start_time, ends_at, ticket_price, venue_paid, is_active, cancelled_at, max_tickets)
+		 VALUES ($1, 'Phase 0 test event', '', $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
 		hostID, start, end, e.Price, e.Paid, e.Active, cancelledAt, e.MaxTix,
 	).Scan(&id); err != nil {
 		t.Fatalf("create event: %v", err)
@@ -126,7 +126,7 @@ func createTestEvent(t *testing.T, db *pgxpool.Pool, hostID string, e testEvent)
 
 func createGuestTicket(t *testing.T, db *pgxpool.Pool, eventID, email string) (ticketID, accessCode string) {
 	t.Helper()
-	accessCode = "T" + uniq()[:9]
+	accessCode = "T" + uniq()
 	if err := db.QueryRow(context.Background(),
 		`INSERT INTO tickets (event_id, guest_email, access_token) VALUES ($1, $2, $3) RETURNING id`,
 		eventID, email, accessCode,

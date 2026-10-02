@@ -26,6 +26,9 @@ type StreamCredentials struct {
 type IVSService struct {
 	client  *ivs.Client
 	Enabled bool
+	// AuthorizedChannels creates new channels with playback authorization
+	// on, so they only play with a server-signed token (IVS_PLAYBACK_AUTH).
+	AuthorizedChannels bool
 }
 
 func NewIVSService(accessKeyID, secretKey, region string) *IVSService {
@@ -50,9 +53,13 @@ func (s *IVSService) ProvisionChannel(ctx context.Context, eventTitle string) (*
 	// LOW latency and STANDARD type are the IVS defaults. Supplying only the
 	// sanitized name avoids account/SDK validation differences for optional
 	// enum fields while retaining the desired channel configuration.
-	out, err := s.client.CreateChannel(ctx, &ivs.CreateChannelInput{
+	in := &ivs.CreateChannelInput{
 		Name: aws.String(ivsChannelName(eventTitle)),
-	})
+	}
+	if s.AuthorizedChannels {
+		in.Authorized = true
+	}
+	out, err := s.client.CreateChannel(ctx, in)
 	if err != nil {
 		return nil, fmt.Errorf("IVS CreateChannel: %w", err)
 	}

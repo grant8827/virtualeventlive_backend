@@ -39,7 +39,17 @@ type Config struct {
 	AWSSecretAccessKey string
 	AWSRegion          string
 	S3BucketName       string
-	S3Region           string
+
+	// IVS private playback. IVSPlaybackPrivateKey is the PEM private half of
+	// an ECDSA P-384 playback key pair whose public half is imported into
+	// IVS. With IVSPlaybackAuthRequired, new channels are created with
+	// authorization on and playback URLs are only ever handed out signed.
+	IVSPlaybackPrivateKey   string
+	IVSPlaybackAuthRequired bool
+	// Origin allowed to play signed streams, e.g. https://virtualeventplus.com
+	// ("*" when empty, which mobile apps need).
+	IVSPlaybackAllowOrigin string
+	S3Region               string
 
 	// WiPay — Caribbean payout rail. Host payouts are sent to WipayAccountNumber
 	// via WipayAPIBaseURL once WiPay confirms their disbursement endpoint contract;
@@ -89,7 +99,11 @@ func Load() *Config {
 		AWSSecretAccessKey:  getEnv("AWS_SECRET_ACCESS_KEY", ""),
 		AWSRegion:           getEnv("AWS_REGION", "us-east-1"),
 		S3BucketName:        getEnv("S3_BUCKET_NAME", ""),
-		S3Region:            getEnv("S3_REGION", getEnv("AWS_REGION", "us-east-1")),
+
+		IVSPlaybackPrivateKey:   getEnv("IVS_PLAYBACK_PRIVATE_KEY", ""),
+		IVSPlaybackAuthRequired: getEnv("IVS_PLAYBACK_AUTH", "") == "required",
+		IVSPlaybackAllowOrigin:  getEnv("IVS_PLAYBACK_ALLOW_ORIGIN", ""),
+		S3Region:                getEnv("S3_REGION", getEnv("AWS_REGION", "us-east-1")),
 
 		WipayAccountNumber: getEnv("WIPAY_ACCOUNT_NUMBER", ""),
 		WipayCheckoutURL:   getEnv("WIPAY_CHECKOUT_URL", ""),

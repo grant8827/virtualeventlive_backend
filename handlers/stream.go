@@ -11,7 +11,8 @@ import (
 
 type StreamHandler struct {
 	DB    *pgxpool.Pool
-	Guard *services.SessionGuard
+	Guard    *services.SessionGuard
+	Playback *PlaybackAccess
 }
 
 type streamRequest struct {
@@ -37,16 +38,19 @@ func (h *StreamHandler) Watch(c *fiber.Ctx) error {
 	}
 
 	// Verify ticket belongs to this buyer and fetch the event's playback URL
-	var playbackURL *string
+	var playbackURL, channelARN *string
 	err := h.DB.QueryRow(context.Background(),
-		`SELECT e.aws_playback_url
+		`SELECT e.aws_playback_url, e.aws_channel_arn
 		 FROM tickets t
 		 JOIN events e ON e.id = t.event_id
 		 WHERE t.access_token = $1
 		   AND t.buyer_id     = $2
-		   AND e.is_active    = true`,
+		   AND e.is_active    = true
+		   AND e.venue_paid   = true
+		   AND e.cancelled_at IS NULL
+		   AND e.ends_at      > NOW()`,
 		req.TicketToken, buyerID,
-	).Scan(&playbackURL)
+	).Scan(&playbackURL, &channelARN)
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "ticket not found or event is no longer active",
@@ -71,9 +75,13 @@ func (h *StreamHandler) Watch(c *fiber.Ctx) error {
 		})
 	}
 
+	playURL, err := h.Playback.URL(playbackURL, channelARN)
+	if err != nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "The stream can't be opened right now."})
+	}
 	return c.JSON(fiber.Map{
 		"status":           "authorized",
-		"playback_url":     *playbackURL,
+		"playback_url":     playURL,
 		"lease_expires_in": int(services.LeaseTTL.Seconds()),
 	})
 }

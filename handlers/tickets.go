@@ -20,10 +20,11 @@ import (
 )
 
 type TicketHandler struct {
-	DB     *pgxpool.Pool
-	Cfg    *config.Config
-	Email  *services.EmailService
-	PayPal *services.PayPalService
+	DB       *pgxpool.Pool
+	Cfg      *config.Config
+	Email    *services.EmailService
+	PayPal   *services.PayPalService
+	Playback *PlaybackAccess
 }
 
 func (h *TicketHandler) ListMine(c *fiber.Ctx) error {
@@ -104,16 +105,21 @@ func (h *TicketHandler) Enter(c *fiber.Ctx) error {
 		isActive         bool
 		endsAt           time.Time
 		playbackURL      *string
+		channelARN       *string
+		venuePaid        bool
+		cancelled        bool
 		ticketType       string
 		checkedInChannel *string
 	)
 	err := h.DB.QueryRow(context.Background(),
-		`SELECT t.id, e.id, e.title, e.is_active, e.ends_at, e.aws_playback_url, e.ticket_type, t.checked_in_channel
+		`SELECT t.id, e.id, e.title, e.is_active, e.ends_at, e.aws_playback_url, e.aws_channel_arn,
+		        e.venue_paid, e.cancelled_at IS NOT NULL, e.ticket_type, t.checked_in_channel
 		 FROM tickets t
 		 JOIN events e ON e.id = t.event_id
 		 WHERE t.access_token = $1`,
 		code,
-	).Scan(&ticketID, &eventID, &eventTitle, &isActive, &endsAt, &playbackURL, &ticketType, &checkedInChannel)
+	).Scan(&ticketID, &eventID, &eventTitle, &isActive, &endsAt, &playbackURL, &channelARN,
+		&venuePaid, &cancelled, &ticketType, &checkedInChannel)
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "ticket not found"})
 	}
@@ -121,7 +127,10 @@ func (h *TicketHandler) Enter(c *fiber.Ctx) error {
 	if time.Now().After(endsAt) {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "This event has ended."})
 	}
-	if !isActive {
+	if cancelled {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "This event was cancelled."})
+	}
+	if !isActive || !venuePaid {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "This event is not active yet."})
 	}
 
@@ -144,13 +153,19 @@ func (h *TicketHandler) Enter(c *fiber.Ctx) error {
 		}
 	}
 
+	// The ticket is valid for an active, unexpired event: only now is a
+	// playback URL issued — signed and short-lived once IVS signing is set up.
+	playURL, err := h.Playback.URL(playbackURL, channelARN)
+	if err != nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "The stream can't be opened right now. Please try again shortly."})
+	}
 	resp := fiber.Map{
 		"event_id":    eventID,
 		"event_title": eventTitle,
 		"is_active":   isActive,
 	}
-	if playbackURL != nil {
-		resp["playback_url"] = *playbackURL
+	if playURL != "" {
+		resp["playback_url"] = playURL
 	}
 	return c.JSON(resp)
 }

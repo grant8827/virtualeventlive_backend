@@ -33,7 +33,15 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("APP_ENV must be production, development or test (got %q)", c.AppEnv)
 	}
-	return ValidateJWTSecret(c.JWTSecret, c.IsDevelopment())
+	if err := ValidateJWTSecret(c.JWTSecret, c.IsDevelopment()); err != nil {
+		return err
+	}
+	// Requiring signed playback without a signing key would make every
+	// stream unwatchable; refuse to start instead.
+	if c.IVSPlaybackAuthRequired && strings.TrimSpace(c.IVSPlaybackPrivateKey) == "" {
+		return errors.New("IVS_PLAYBACK_AUTH=required but IVS_PLAYBACK_PRIVATE_KEY is not set")
+	}
+	return nil
 }
 
 // ValidateJWTSecret rejects missing, placeholder and low-entropy secrets.
